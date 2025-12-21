@@ -280,19 +280,24 @@ impl<T> FairLock<T> {
 
 impl<T: ?Sized> Lock<T> for FairLock<T> {
     fn release(&self) {
-        // pop external_waiting_future if and signal.
+        // Extract the signaler to wake (if any), then signal AFTER to avoid
+        // re-entrancy issues. signal() can synchronously wake a task on the
+        // same thread, which may then call release() again.
         //
-        match self.lock_sync.external_waiting_futures.pop() {
-            Some(wait_one) => {
-                // Signal WaitOne and resume execution.
-                //
-                wait_one.signal();
-            }
+        let signaler_to_wake = match self.lock_sync.external_waiting_futures.pop() {
+            Some(wait_one) => Some(wait_one),
             None => {
                 // No waiters, set lock as not acquired.
                 //
                 self.lock_sync.release();
+                None
             }
+        };
+
+        // Signal outside any potential critical section.
+        //
+        if let Some(signaler) = signaler_to_wake {
+            signaler.signal();
         }
     }
 }
@@ -365,25 +370,39 @@ impl<T> UnfairLock<T> {
 
 impl<T: Sized> Lock<T> for UnfairLock<T> {
     fn release(&self) {
-        // Move all waiters into internal vector.
+        // Extract the signaler to wake (if any) while holding the borrow,
+        // then signal AFTER releasing the borrow to avoid re-entrancy panic.
+        // signal() can synchronously wake a task on the same thread, which
+        // may then call release() again - we must not hold the RefCell borrow.
         //
-        let mut waiters = self.external_waiting_futures.borrow_mut();
+        let signaler_to_wake = {
+            let mut waiters = self.external_waiting_futures.borrow_mut();
 
-        while let Some(wait_one) = self.lock_sync.external_waiting_futures.pop() {
-            waiters.push(wait_one);
-        }
-
-        if waiters.is_empty() {
-            // No waiters, set lock as not acquired.
+            // Move all waiters from lock-free queue into internal vector.
             //
-            self.lock_sync.release();
-        } else {
-            let mut rng = rand::rng();
-            let random_index = rng.random_range(0..waiters.len());
+            while let Some(wait_one) = self.lock_sync.external_waiting_futures.pop() {
+                waiters.push(wait_one);
+            }
 
-            // Remove random element, replace with the last one and signal it.
-            //
-            waiters.swap_remove(random_index).signal();
+            if waiters.is_empty() {
+                // No waiters, set lock as not acquired.
+                //
+                self.lock_sync.release();
+                None
+            } else {
+                let mut rng = rand::rng();
+                let random_index = rng.random_range(0..waiters.len());
+
+                // Remove random element - signal after dropping borrow.
+                //
+                Some(waiters.swap_remove(random_index))
+            }
+        };
+
+        // Signal outside the borrow to prevent re-entrancy panic.
+        //
+        if let Some(signaler) = signaler_to_wake {
+            signaler.signal();
         }
     }
 }
@@ -461,54 +480,67 @@ impl<T> ReactorAwareLock<T> {
 
 impl<T: Sized> Lock<T> for ReactorAwareLock<T> {
     fn release(&self) {
-        // Move all waiters into internal vector.
+        // Extract the signaler to wake (if any) while holding the borrow,
+        // then signal AFTER releasing the borrow to avoid re-entrancy panic.
+        // signal() can synchronously wake a task on the same thread, which
+        // may then call release() again - we must not hold the RefCell borrow.
         //
-        let mut waiters = self.external_waiting_futures.borrow_mut();
+        let signaler_to_wake = {
+            let mut waiters = self.external_waiting_futures.borrow_mut();
 
-        while let Some(wait_one) = self.lock_sync.external_waiting_futures.pop() {
-            waiters.push(wait_one);
-        }
-
-        if waiters.is_empty() {
-            // No waiters, set lock as not acquired.
+            // Move all waiters from lock-free queue into internal vector.
             //
-            self.lock_sync.release();
-        } else {
-            let mut counter = self.scan_counter.borrow_mut();
-
-            // Start new round if counter is zero.
-            //
-            if *counter == 0 {
-                *counter = waiters.len();
+            while let Some(wait_one) = self.lock_sync.external_waiting_futures.pop() {
+                waiters.push(wait_one);
             }
 
-            // Scan window is min(counter, waiters.len()) - handles new arrivals.
-            //
-            let scan_window = (*counter).min(waiters.len());
+            if waiters.is_empty() {
+                // No waiters, set lock as not acquired.
+                //
+                self.lock_sync.release();
+                None
+            } else {
+                let mut counter = self.scan_counter.borrow_mut();
 
-            // Find waiter on least loaded reactor within scan window.
-            //
-            let best_index = waiters
-                .iter()
-                .take(scan_window)
-                .enumerate()
-                .min_by_key(|(_, signaler)| {
-                    signaler
-                        .assigned_reactor()
-                        .map(|r| r.external_queue_len())
-                        .unwrap_or(usize::MAX)
-                })
-                .map(|(i, _)| i)
-                .unwrap();
+                // Start new round if counter is zero.
+                //
+                if *counter == 0 {
+                    *counter = waiters.len();
+                }
 
-            // Decrement counter for next release.
-            //
-            *counter = counter.saturating_sub(1);
+                // Scan window is min(counter, waiters.len()) - handles new arrivals.
+                //
+                let scan_window = (*counter).min(waiters.len());
 
-            // Remove and signal the best waiter.
-            // Use swap_remove for O(1) removal.
-            //
-            waiters.swap_remove(best_index).signal();
+                // Find waiter on least loaded reactor within scan window.
+                //
+                let best_index = waiters
+                    .iter()
+                    .take(scan_window)
+                    .enumerate()
+                    .min_by_key(|(_, signaler)| {
+                        signaler
+                            .assigned_reactor()
+                            .map(|r| r.external_queue_len())
+                            .unwrap_or(usize::MAX)
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap();
+
+                // Decrement counter for next release.
+                //
+                *counter = counter.saturating_sub(1);
+
+                // Remove the best waiter - signal after dropping borrow.
+                //
+                Some(waiters.swap_remove(best_index))
+            }
+        };
+
+        // Signal outside the borrow to prevent re-entrancy panic.
+        //
+        if let Some(signaler) = signaler_to_wake {
+            signaler.signal();
         }
     }
 }
