@@ -21,10 +21,10 @@
 //!   Task wants lock
 //!         │
 //!         ▼
-//!   ┌─────────────┐     yes    ┌──────────────────┐
-//!   │ try_acquire ├───────────►│ Lock acquired!   │
+//!   ┌─────────────┐     yes    ┌───────────────────┐
+//!   │ try_acquire ├───────────►│ Lock acquired!    │
 //!   └──────┬──────┘            │ Return immediately│
-//!          │ no                └──────────────────┘
+//!          │ no                └───────────────────┘
 //!          ▼
 //!   ┌─────────────────────────┐
 //!   │ Create waiter (signaler)│
@@ -375,6 +375,10 @@ impl<T: Sized> Lock<T> for UnfairLock<T> {
         // signal() can synchronously wake a task on the same thread, which
         // may then call release() again - we must not hold the RefCell borrow.
         //
+        // IMPORTANT: lock_sync.release() must also be called AFTER dropping
+        // the borrow, because another thread could immediately acquire the
+        // lock and call release(), causing a borrow conflict.
+        //
         let signaler_to_wake = {
             let mut waiters = self.external_waiting_futures.borrow_mut();
 
@@ -385,9 +389,6 @@ impl<T: Sized> Lock<T> for UnfairLock<T> {
             }
 
             if waiters.is_empty() {
-                // No waiters, set lock as not acquired.
-                //
-                self.lock_sync.release();
                 None
             } else {
                 let mut rng = rand::rng();
@@ -399,10 +400,11 @@ impl<T: Sized> Lock<T> for UnfairLock<T> {
             }
         };
 
-        // Signal outside the borrow to prevent re-entrancy panic.
+        // Signal or release outside the borrow to prevent re-entrancy panic.
         //
-        if let Some(signaler) = signaler_to_wake {
-            signaler.signal();
+        match signaler_to_wake {
+            Some(signaler) => signaler.signal(),
+            None => self.lock_sync.release(),
         }
     }
 }
@@ -485,6 +487,10 @@ impl<T: Sized> Lock<T> for ReactorAwareLock<T> {
         // signal() can synchronously wake a task on the same thread, which
         // may then call release() again - we must not hold the RefCell borrow.
         //
+        // IMPORTANT: lock_sync.release() must also be called AFTER dropping
+        // the borrow, because another thread could immediately acquire the
+        // lock and call release(), causing a borrow conflict.
+        //
         let signaler_to_wake = {
             let mut waiters = self.external_waiting_futures.borrow_mut();
 
@@ -495,9 +501,6 @@ impl<T: Sized> Lock<T> for ReactorAwareLock<T> {
             }
 
             if waiters.is_empty() {
-                // No waiters, set lock as not acquired.
-                //
-                self.lock_sync.release();
                 None
             } else {
                 let mut counter = self.scan_counter.borrow_mut();
@@ -537,10 +540,11 @@ impl<T: Sized> Lock<T> for ReactorAwareLock<T> {
             }
         };
 
-        // Signal outside the borrow to prevent re-entrancy panic.
+        // Signal or release outside the borrow to prevent re-entrancy panic.
         //
-        if let Some(signaler) = signaler_to_wake {
-            signaler.signal();
+        match signaler_to_wake {
+            Some(signaler) => signaler.signal(),
+            None => self.lock_sync.release(),
         }
     }
 }
