@@ -1,0 +1,12 @@
+[package]
+name = "starfish-tls"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rcgen = "0.13.2"
+rustls = "0.23.31"
+rustls-pemfile = "2.2.0"
+starfish-core = { version = "0.1.0", path = "../starfish-core" }
+starfish-reactor = { version = "0.1.0", path = "../starfish-reactor" }
+webpki-roots = "0.26.8"

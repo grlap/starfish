@@ -1,0 +1,24 @@
+[package]
+name = "starfish-crossbeam"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossbeam-epoch = "0.9.18"
+mimalloc = { version = "0.1.48", features = ["v3"] }
+starfish-core = { version = "0.1.0", path = "../starfish-core", features = ["sorted_collection_core_tests"] }
+starfish-storage = { version = "0.1.0", path = "../starfish-storage" }
+
+[dev-dependencies]
+criterion = "0.5"
+crossbeam-skiplist = "0.1"
+rstest = "0.18"
+serial_test = "3.0"
+
+[[bench]]
+name = "sorted_collection_benchmark"
+harness = false
+
+[[bench]]
+name = "hash_map_benchmark"
+harness = false

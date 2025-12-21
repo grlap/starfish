@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+  "starfish-core",
+  "starfish-crossbeam",
+  "starfish-epoch",
+  "starfish-http",
+  "starfish-reactor",
+  "starfish-storage",
+  "starfish-tls",
+]
+
+[profile.release]
+debug = true  # or debug = 1 for line tables only
+
+[profile.bench]
+debug = 2
+lto = "thin"
+
+[profile.dev]
+opt-level = 0           # No optimizations
+debug = 2            # Full debug info
+debug-assertions = true # Enable debug assertions
+overflow-checks = true  # Enable integer overflow checks
+lto = false             # No Link Time Optimization
+panic = 'unwind'        # Unwind on panic
+incremental = true      # Incremental compilation
+codegen-units = 256     # Maximum parallel code generation
+rpath = false           # No runtime path for dynamic linking
+
+[profile.test]
+opt-level = 0
+debug = 2
+debug-assertions = true # Enable debug assertions
+overflow-checks = true  # Enable integer overflow checks
+lto = false             # No Link Time Optimization
+incremental = true      # Incremental compilation
+codegen-units = 256     # Maximum parallel code generation
+rpath = false           # No runtime path for dynamic linking
