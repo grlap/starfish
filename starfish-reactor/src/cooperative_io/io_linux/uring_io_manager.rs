@@ -5,7 +5,6 @@ use std::time::{Duration, UNIX_EPOCH};
 use io_uring::IoUring;
 use io_uring::opcode;
 use io_uring::types;
-use libc::EBUSY;
 
 use crate::cooperative_io::io_manager::{IOManager, IOManagerCreateOptions, IOManagerHolder};
 use crate::reactor::FutureRuntime;
@@ -15,6 +14,7 @@ use super::io_wait_future::IOWaitFuture;
 pub(crate) struct UringIOManager {
     io_uring: IoUring,
     active_io: i32,
+    pending_submit: bool,
 }
 
 /// [`UringIOManager`].
@@ -27,6 +27,7 @@ impl UringIOManager {
         Ok(UringIOManager {
             io_uring,
             active_io: 0,
+            pending_submit: false,
         })
     }
 }
@@ -45,11 +46,21 @@ impl IOManager for UringIOManager {
             return None;
         }
 
+        // Retry any pending submit from previous failed attempt.
+        //
+        if self.pending_submit && self.io_uring.submit().is_ok() {
+            self.pending_submit = false;
+        }
+
         let completed_entry = self.io_uring.completion().next();
         let result: Option<(FutureRuntime, *const IOWaitFuture)> = match completed_entry {
             Some(queue_entry) => {
+                self.active_io -= 1;
+
                 let io_wait_future_ptr = queue_entry.user_data() as *mut IOWaitFuture;
 
+                // Null user_data indicates a linked timeout completion - already decremented active_io.
+                //
                 if io_wait_future_ptr.is_null() {
                     None
                 } else {
@@ -64,8 +75,6 @@ impl IOManager for UringIOManager {
                     }
 
                     let future_runtime = completed_io_wait_future.take_future_runtime().unwrap();
-
-                    self.active_io -= 1;
 
                     Some((future_runtime, io_wait_future_ptr))
                 }
@@ -93,30 +102,30 @@ impl IOManager for UringIOManager {
                 //
                 queue_entry = queue_entry.flags(io_uring::squeue::Flags::IO_LINK);
 
-                let result = unsafe { self.io_uring.submission().push(&queue_entry) };
+                unsafe { self.io_uring.submission().push(&queue_entry) }
+                    .map_err(|_| io::Error::from_raw_os_error(libc::EBUSY))?;
 
-                if result.is_err() {
-                    return Err(io::Error::from_raw_os_error(EBUSY));
-                }
+                self.active_io += 1;
 
-                // Create a Timespec entry for timeout.
+                // Create a Timespec entry for linked timeout.
                 //
                 let duration = timeout
                     .cancel_at_time()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or(Duration::from_secs(0));
 
-                let ts = types::Timespec::new();
-                ts.sec(duration.as_secs());
-                ts.nsec(duration.subsec_nanos());
+                let ts = types::Timespec::new()
+                    .sec(duration.as_secs())
+                    .nsec(duration.subsec_nanos());
 
-                let timeout_op = opcode::Timeout::new(&ts).build();
+                // Use LinkTimeout for linked operations, with null user_data.
+                //
+                let timeout_op = opcode::LinkTimeout::new(&ts).build().user_data(0);
 
-                let result = unsafe { self.io_uring.submission().push(&timeout_op) };
+                unsafe { self.io_uring.submission().push(&timeout_op) }
+                    .map_err(|_| io::Error::from_raw_os_error(libc::EBUSY))?;
 
-                if result.is_err() {
-                    return Err(io::Error::from_raw_os_error(EBUSY));
-                }
+                self.active_io += 1;
 
                 // Reset future timeout as it is no longer needed.
                 // Reactor will not track the timeout.
@@ -124,27 +133,23 @@ impl IOManager for UringIOManager {
                 io_wait_future.set_timeout(None);
             }
             None => {
-                // Not timeout specified, enqueue request.
+                // No timeout specified, enqueue request.
                 //
-                let result = unsafe { self.io_uring.submission().push(&queue_entry) };
+                unsafe { self.io_uring.submission().push(&queue_entry) }
+                    .map_err(|_| io::Error::from_raw_os_error(libc::EBUSY))?;
 
-                if result.is_err() {
-                    return Err(io::Error::from_raw_os_error(EBUSY));
-                }
-            }
-        }
-
-        // Submit request.
-        //
-        let result = self.io_uring.submit();
-
-        match result {
-            Ok(_) => {
                 self.active_io += 1;
-                Ok(())
             }
-            Err(_) => Err(io::Error::from_raw_os_error(EBUSY)),
+        };
+
+        // Submit request. If submit fails, defer to next completed_io call.
+        // We must return Ok to keep the pinned IOWaitFuture alive.
+        //
+        if self.io_uring.submit().is_err() {
+            self.pending_submit = true;
         }
+
+        Ok(())
     }
 
     /// See [`IOManager::cancel_io_wait`].
