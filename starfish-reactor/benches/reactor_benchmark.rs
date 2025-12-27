@@ -1,12 +1,13 @@
 use std::future::Future;
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
-
+use criterion::Criterion;
+use criterion::black_box;
+use criterion::criterion_group;
+use criterion::criterion_main;
+use mimalloc::MiMalloc;
 use starfish_reactor::cooperative_io::io_manager::NoopIOManagerCreateOptions;
 use starfish_reactor::coordinator::Coordinator;
 use starfish_reactor::reactor::Reactor;
-
-use mimalloc::MiMalloc;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -172,11 +173,14 @@ fn cross_reactor_benchmark(c: &mut Criterion) {
 
     // Cross-reactor: spawn_external to same reactor (measures queue overhead).
     //
+    // NOTE: Coordinator is created outside b.iter() to avoid file descriptor exhaustion.
+    // Each Coordinator creates io_uring/epoll FDs, and Criterion runs hundreds of iterations.
+    //
     group.bench_function("spawn_external_same_reactor_1000", |b| {
-        b.iter(|| {
-            let mut coordinator = Coordinator::new();
-            coordinator.initialize_with_io_manager(NoopIOManagerCreateOptions::new(), 1);
+        let mut coordinator = Coordinator::new();
+        coordinator.initialize_with_io_manager(NoopIOManagerCreateOptions::new(), 1);
 
+        b.iter(|| {
             let completed = Arc::new(AtomicUsize::new(0));
             let done_event = Arc::new(CountdownEvent::new(1000));
 
@@ -191,19 +195,20 @@ fn cross_reactor_benchmark(c: &mut Criterion) {
             }
 
             done_event.wait();
-            coordinator.join_all().unwrap();
 
             black_box(completed.load(Ordering::Relaxed))
-        })
+        });
+
+        coordinator.join_all().unwrap();
     });
 
     // Cross-reactor: spawn_external to different reactors (round-robin).
     //
     group.bench_function("spawn_external_cross_reactor_1000", |b| {
-        b.iter(|| {
-            let mut coordinator = Coordinator::new();
-            coordinator.initialize_with_io_manager(NoopIOManagerCreateOptions::new(), 4);
+        let mut coordinator = Coordinator::new();
+        coordinator.initialize_with_io_manager(NoopIOManagerCreateOptions::new(), 4);
 
+        b.iter(|| {
             let completed = Arc::new(AtomicUsize::new(0));
             let done_event = Arc::new(CountdownEvent::new(1000));
 
@@ -219,19 +224,20 @@ fn cross_reactor_benchmark(c: &mut Criterion) {
             }
 
             done_event.wait();
-            coordinator.join_all().unwrap();
 
             black_box(completed.load(Ordering::Relaxed))
-        })
+        });
+
+        coordinator.join_all().unwrap();
     });
 
     // Cross-reactor ping-pong: reactor 0 -> reactor 1 -> reactor 0 (round-trip).
     //
     group.bench_function("cross_reactor_pingpong_100", |b| {
-        b.iter(|| {
-            let mut coordinator = Coordinator::new();
-            coordinator.initialize_with_io_manager(NoopIOManagerCreateOptions::new(), 2);
+        let mut coordinator = Coordinator::new();
+        coordinator.initialize_with_io_manager(NoopIOManagerCreateOptions::new(), 2);
 
+        b.iter(|| {
             let done_event = Arc::new(CountdownEvent::new(1));
 
             fn pingpong(
@@ -260,17 +266,18 @@ fn cross_reactor_benchmark(c: &mut Criterion) {
             drop(Coordinator::reactor(0).spawn_external(pingpong(100, done_event.clone())));
 
             done_event.wait();
-            coordinator.join_all().unwrap();
-        })
+        });
+
+        coordinator.join_all().unwrap();
     });
 
     // Chain stress: reactor 0 -> 1 -> 2 -> 3 -> 0 -> ... (measures chain overhead).
     //
     group.bench_function("cross_reactor_chain_depth_10_chains_100", |b| {
-        b.iter(|| {
-            let mut coordinator = Coordinator::new();
-            coordinator.initialize_with_io_manager(NoopIOManagerCreateOptions::new(), 4);
+        let mut coordinator = Coordinator::new();
+        coordinator.initialize_with_io_manager(NoopIOManagerCreateOptions::new(), 4);
 
+        b.iter(|| {
             let completed = Arc::new(AtomicUsize::new(0));
             let done_event = Arc::new(CountdownEvent::new(100));
 
@@ -317,10 +324,11 @@ fn cross_reactor_benchmark(c: &mut Criterion) {
             }
 
             done_event.wait();
-            coordinator.join_all().unwrap();
 
             black_box(completed.load(Ordering::Relaxed))
-        })
+        });
+
+        coordinator.join_all().unwrap();
     });
 
     group.finish();

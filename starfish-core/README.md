@@ -10,7 +10,6 @@ Core library providing high-performance, lock-free concurrent data structures an
 
 - **Lock-free data structures** - Concurrent sorted lists, skip lists, and hash maps
 - **Atomic update operation** - UPDATE_MARK-based in-place updates without "missing key" windows
-- **Backlink support** - Optimized traversal recovery when encountering deleted or updated nodes
 - **Batch insert optimization** - NodePosition-based O(1) amortized inserts for sorted data (6-7x faster for SortedList)
 - **Trait-based design** - Pluggable memory reclamation strategies (epoch-based, hazard pointers, reference counting)
 - **Synchronization primitives** - CountdownEvent and future utilities
@@ -23,11 +22,7 @@ The library follows a layered architecture separating algorithm implementation f
 ```
 User Code
    ↓ uses
-SafeSortedCollection           ← Safe, high-level API
-   ↓ implemented by
 EpochGuardedCollection         ← Epoch-based memory safety (starfish-crossbeam)
-HazardPointerCollection        ← Hazard pointer-based safety
-RcCollection                   ← Reference counting
    ↓ wraps
 SortedCollection               ← Low-level algorithm trait
    ↓ implemented by
@@ -42,7 +37,6 @@ SortedList, SkipList, etc.     ← Actual data structures
 |-----------|------------|--------------|-------------|
 | `SortedList` | O(n) | 6-7x faster | Harris's lock-free linked list |
 | `SkipList` | O(log n) | ~10% faster | Probabilistic multi-level skip list (16 levels, p=0.5) |
-| `SkipListBacklinks` | O(log n) | ~15% faster | Skip list with backlinks for deletion recovery |
 
 ### Hash Maps
 
@@ -85,30 +79,6 @@ pub trait SortedCollection<T: Eq + Ord> {
 The `NodePosition` trait stores predecessors at ALL levels, enabling O(1) amortized batch inserts for sorted data (similar to RocksDB's "splice" pattern).
 
 The `update_internal` method provides atomic in-place updates using UPDATE_MARK. The key is never "missing" during an update - readers always see either the old or new value.
-
-### `SafeSortedCollection<T>`
-
-High-level safe API with memory protection:
-
-```rust
-pub trait SafeSortedCollection<T: Eq + Ord> {
-    type GuardedRef<'a>: Deref<Target = T> where Self: 'a, T: 'a;
-    type Iter<'a>: Iterator<Item = Self::GuardedRef<'a>>;
-
-    fn insert(&self, key: T) -> bool;
-    fn delete(&self, key: &T) -> bool;
-    fn remove(&self, key: &T) -> Option<T> where T: Clone;
-    fn update(&self, new_value: T) -> bool;  // Atomic node replacement
-    fn contains(&self, key: &T) -> bool;
-    fn find(&self, key: &T) -> Option<Self::GuardedRef<'_>>;
-    fn find_and_apply<F, R>(&self, key: &T, f: F) -> Option<R> where F: FnOnce(&T) -> R;
-
-    // Batch operations
-    fn insert_batch<I>(&self, iter: I) -> usize where I: OrderedIterator<Item = T>;
-    fn iter(&self) -> Self::Iter<'_>;
-    fn iter_from(&self, start_key: &T) -> Self::Iter<'_>;
-}
-```
 
 ### `HashMapCollection<K, V>`
 
@@ -336,46 +306,42 @@ INSERT may be linking higher levels while DELETE is trying to remove the same no
 **The Problem:**
 ```
 INSERT: links level 0, then level 1, then level 2...
-DELETE: finds node, sets backlinks, marks levels...
+DELETE: finds node, marks levels, unlinks...
 ```
 
-If DELETE sets backlinks while INSERT is still linking, the new levels won't have backlinks set.
+If DELETE marks levels while INSERT is still linking, there's a race condition.
 
 **Solution: 0|DEL (null pointer with DELETE mark)**
 
 DELETE claims unlinked levels by setting `node.next[level] = 0|DEL`. INSERT checks for this signal.
 
-### DELETE Algorithm (SkipListBacklinks)
+### DELETE Algorithm (SkipList)
 
 ```
 1. FIND POSITION
    - find_position returns preds[] and succs[] at all levels
 
-2. SET BACKLINKS FOR ALL LEVELS (before any marking!)
-   - For level 0 to height-1: node.prev[level] = preds[level]
-   - Ensures backlink chain is always valid
-
-3. CLAIM UNLINKED LEVELS WITH 0|DEL (height-1 → 1, top-down)
+2. CLAIM UNLINKED LEVELS WITH 0|DEL (height-1 → 1, top-down)
    - For each level from height-1 down to 1:
      - If node.next[level] == 0: CAS to 0|DEL
      - If node.next[level] != 0: level is LINKED
    - Purpose: Signal INSERT to stop
 
-4. MARK AND UNLINK HIGHER LINKED LEVELS (height-1 → 1)
+3. MARK AND UNLINK HIGHER LINKED LEVELS (height-1 → 1)
    - Skip levels with 0|DEL (not linked)
    - Mark: CAS node.next[level] = succ → succ|DEL
    - Unlink: CAS pred.next[level] = node → succ
 
-5. MARK LEVEL 0 (linearization point - ownership)
+4. MARK LEVEL 0 (linearization point - ownership)
    - CAS: node.next[0] = succ → succ|DEL
    - If already marked, return None (another thread owns it)
 
-6. UNLINK LEVEL 0
+5. UNLINK LEVEL 0
    - CAS: pred.next[0] = node → succ
    - Return node for deferred destruction
 ```
 
-### INSERT Algorithm (SkipListBacklinks)
+### INSERT Algorithm (SkipList)
 
 ```
 1. FIND POSITION
@@ -400,7 +366,7 @@ DELETE claims unlinked levels by setting `node.next[level] = 0|DEL`. INSERT chec
       - If fails with 0|DEL → STOP (DELETE claimed it)
 
    c. HANDLE PRED ISSUES
-      - If pred is marked → use backlinks
+      - If pred is marked → recover from higher level or restart
 
    d. LINK NODE
       - CAS: pred.next[level] = succ → new_node
@@ -449,57 +415,11 @@ Step 3:  pred → B' → succ              (Unlink B from all levels)
    - If we marked with succ, find_at_level would snip to succ, bypassing B'
    - This would break the skip list structure and cause hangs/cycles
 
-### Backlink Recovery
+### Recovery from Marked Predecessors
 
 When a predecessor is marked during traversal:
-- **With backlinks** (`SkipListBacklinks`): O(1) recovery via `find_valid_pred_via_backlink`
-- **With start_node restart** (`SortedList`): Restart traversal from provided start_node or HEAD
-- **Without backlinks** (`SkipList`): O(n) recovery by restarting from HEAD
-
-**Backlink Invariants (SkipListBacklinks)**:
-
-1. **Always use backlinks** - Never fall back to HEAD when backlinks should be available
-2. **Panic on violations** - If a marked node has no backlink, panic immediately (don't mask the bug)
-3. **Set backlinks before marking** - delete/update MUST set `node.prev[level]` at ALL levels BEFORE marking ANY level
-4. **No workarounds** - Lock-free algorithms must be correct by design; adding hacks to hide bugs makes debugging impossible
-
-```rust
-// Backlink recovery pattern (same as SortedList):
-fn find_valid_pred_via_backlink(node, level) -> *mut Node {
-    let mut curr = node;
-    loop {
-        if curr is HEAD or sentinel { return HEAD; }
-        if curr is NOT marked { return curr; }  // Already valid
-        // curr is marked - follow backlink (MUST exist)
-        curr = curr.prev[level];  // Panic if null
-    }
-}
-```
-
-## Known Issues
-
-### SkipList (without backlinks) - Concurrent Bugs
-
-**Status**: Disabled in stress tests and benchmarks. Use `SkipListBacklinks` instead.
-
-The `SkipList` implementation (without backlinks) has known bugs under high concurrency:
-
-1. **Sentinel Node Access**: Under certain race conditions, traversal can incorrectly reach the HEAD sentinel node and attempt to call `key()` on it, causing a panic: "Cannot get key from sentinel node" (`skip_list.rs:245`)
-
-2. **Livelock Potential**: Without backlinks, when a predecessor node is marked during traversal, the algorithm must restart from HEAD (O(n) recovery). Under high contention, this can cause performance degradation or near-livelock behavior.
-
-3. **Heap Corruption**: Some concurrent scenarios may lead to memory corruption due to improper node unlinking.
-
-**Workaround**: Use `SkipListBacklinks` which provides O(1) recovery via backlinks and has been extensively tested under high contention scenarios.
-
-```rust
-// Recommended
-use starfish_core::data_structures::SkipListBacklinks;
-let list = SkipListBacklinks::<i32>::new();
-
-// Not recommended for concurrent use
-// use starfish_core::data_structures::SkipList;
-```
+- **SortedList**: Restart traversal from provided start_node or HEAD
+- **SkipList**: Use preds[level+1] to recover from higher level, or restart from HEAD
 
 ## License
 

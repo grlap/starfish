@@ -1,12 +1,12 @@
 use std::sync::Arc;
 use std::thread;
 
-use crate::data_structures::{Ordered, SafeSortedCollection, ordered_from_vec};
+use crate::data_structures::{Ordered, SortedCollection, ordered_from_vec};
 
 /// Test basic insert, contains, and duplicate rejection
 pub fn test_basic_operations<C>(collection: &C)
 where
-    C: SafeSortedCollection<i32>,
+    C: SortedCollection<i32>,
 {
     // Test insert
     assert!(collection.insert(5));
@@ -43,7 +43,7 @@ where
 /// Test concurrent insertions from multiple threads
 pub fn test_concurrent_operations<C>()
 where
-    C: SafeSortedCollection<i32> + Default + Send + Sync + 'static,
+    C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
     let num_threads = 4;
@@ -74,7 +74,7 @@ where
 /// Test find_and_apply functionality
 pub fn test_find_and_apply<C>(collection: &C)
 where
-    C: SafeSortedCollection<i32>,
+    C: SortedCollection<i32>,
 {
     collection.insert(5);
     collection.insert(10);
@@ -93,7 +93,7 @@ where
 /// Test concurrent mixed operations (insert, delete, contains)
 pub fn test_concurrent_mixed_operations<C>()
 where
-    C: SafeSortedCollection<i32> + Default + Send + Sync + 'static,
+    C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
     let num_threads = 6;
@@ -111,7 +111,7 @@ where
                 for i in 0..num_operations {
                     let key = (thread_id * num_operations + i) % 500;
 
-                    match i % 4 {
+                    match i % 5 {
                         0 => {
                             collection.insert(key);
                         }
@@ -123,6 +123,9 @@ where
                         }
                         3 => {
                             let _ = collection.find(&key);
+                        }
+                        4 => {
+                            collection.update(key);
                         }
                         _ => unreachable!(),
                     }
@@ -139,7 +142,7 @@ where
 /// Test remove returns value
 pub fn test_remove_returns_value<C>()
 where
-    C: SafeSortedCollection<i32> + Default,
+    C: SortedCollection<i32> + Default,
 {
     let collection = C::default();
 
@@ -163,7 +166,7 @@ where
 /// Test find returns reference
 pub fn test_find<C>()
 where
-    C: SafeSortedCollection<i32> + Default,
+    C: SortedCollection<i32> + Default,
 {
     let collection = C::default();
 
@@ -184,7 +187,7 @@ where
 /// Test sequential insert and delete pattern
 pub fn test_sequential_operations<C>()
 where
-    C: SafeSortedCollection<i32> + Default,
+    C: SortedCollection<i32> + Default,
 {
     let collection = C::default();
 
@@ -217,7 +220,7 @@ where
 /// Test high contention on same keys
 pub fn test_high_contention<C>()
 where
-    C: SafeSortedCollection<i32> + Default + Send + Sync + 'static,
+    C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
     let num_threads = 16;
@@ -247,7 +250,7 @@ where
 /// Test is_empty functionality
 pub fn test_is_empty<C>()
 where
-    C: SafeSortedCollection<i32> + Default,
+    C: SortedCollection<i32> + Default,
 {
     let collection = C::default();
 
@@ -263,7 +266,7 @@ where
 /// Test insert_batch with ordered data
 pub fn test_insert_batch_basic<C>()
 where
-    C: SafeSortedCollection<i32> + Default,
+    C: SortedCollection<i32> + Default,
 {
     let collection = C::default();
 
@@ -283,7 +286,7 @@ where
 /// Test insert_batch with empty iterator
 pub fn test_insert_batch_empty<C>()
 where
-    C: SafeSortedCollection<i32> + Default,
+    C: SortedCollection<i32> + Default,
 {
     let collection = C::default();
 
@@ -298,7 +301,7 @@ where
 /// Test insert_batch with duplicates in the batch
 pub fn test_insert_batch_with_duplicates<C>()
 where
-    C: SafeSortedCollection<i32> + Default,
+    C: SortedCollection<i32> + Default,
 {
     let collection = C::default();
 
@@ -315,15 +318,15 @@ where
         assert!(collection.contains(&i), "Missing key: {}", i);
     }
 
-    // Verify iteration returns exactly unique values (no duplicates stored)
-    let items: Vec<i32> = collection.iter().map(|x| *x).collect();
+    // Verify to_vec returns exactly unique values (no duplicates stored)
+    let items = collection.to_vec();
     assert_eq!(items, vec![1, 2, 3, 4, 5]);
 }
 
 /// Test insert_batch with pre-existing items
 pub fn test_insert_batch_with_existing<C>()
 where
-    C: SafeSortedCollection<i32> + Default,
+    C: SortedCollection<i32> + Default,
 {
     let collection = C::default();
 
@@ -348,7 +351,7 @@ where
 /// Test insert_batch using ordered_from_vec helper
 pub fn test_insert_batch_from_unsorted<C>()
 where
-    C: SafeSortedCollection<i32> + Default,
+    C: SortedCollection<i32> + Default,
 {
     let collection = C::default();
 
@@ -359,15 +362,15 @@ where
 
     assert_eq!(inserted, 5);
 
-    // Verify all items are present and iteration is ordered
-    let items: Vec<i32> = collection.iter().map(|x| *x).collect();
+    // Verify all items are present and to_vec is ordered
+    let items = collection.to_vec();
     assert_eq!(items, vec![1, 2, 3, 4, 5]);
 }
 
 /// Test insert_batch maintains sorted order
 pub fn test_insert_batch_preserves_order<C>()
 where
-    C: SafeSortedCollection<i32> + Default,
+    C: SortedCollection<i32> + Default,
 {
     let collection = C::default();
 
@@ -381,15 +384,15 @@ where
     let ordered2 = Ordered::new(data2.into_iter());
     collection.insert_batch(ordered2);
 
-    // Verify order via iteration
-    let items: Vec<i32> = collection.iter().map(|x| *x).collect();
+    // Verify order via to_vec
+    let items = collection.to_vec();
     assert_eq!(items, vec![5, 10, 15, 20, 25, 30, 35]);
 }
 
 /// Test insert_batch with large dataset
 pub fn test_insert_batch_large<C>()
 where
-    C: SafeSortedCollection<i32> + Default,
+    C: SortedCollection<i32> + Default,
 {
     let collection = C::default();
 
@@ -405,8 +408,104 @@ where
         assert!(collection.contains(&i), "Missing key: {}", i);
     }
 
-    // Verify ordered iteration
-    let items: Vec<i32> = collection.iter().map(|x| *x).collect();
+    // Verify ordered to_vec
+    let items = collection.to_vec();
     let expected: Vec<i32> = (0..1000).collect();
     assert_eq!(items, expected);
+}
+
+/// Test update operations
+pub fn test_update_operations<C>(collection: &C)
+where
+    C: SortedCollection<i32>,
+{
+    collection.insert(10);
+    collection.insert(20);
+
+    // Update existing value
+    assert!(collection.update(10));
+    assert!(collection.contains(&10));
+
+    // Update non-existing value
+    assert!(!collection.update(30));
+    assert!(!collection.contains(&30));
+
+    // Insert new check
+    assert!(collection.insert(30));
+    assert!(collection.update(30));
+}
+
+/// Test concurrent update operations
+pub fn test_concurrent_update_operations<C>()
+where
+    C: SortedCollection<i32> + Default + Send + Sync + 'static,
+{
+    let collection = Arc::new(C::default());
+    let num_threads = 4;
+    let items_per_thread = 100;
+
+    // Pre-populate
+    for i in 0..(num_threads * items_per_thread) {
+        collection.insert(i);
+    }
+
+    let handles: Vec<_> = (0..num_threads)
+        .map(|thread_id| {
+            let collection = Arc::clone(&collection);
+            thread::spawn(move || {
+                for i in 0..items_per_thread {
+                    let key = thread_id * items_per_thread + i;
+                    // Update should succeed as keys exist
+                    assert!(collection.update(key));
+                }
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+}
+
+/// Test len operations
+pub fn test_len_operations<C>(collection: &C)
+where
+    C: SortedCollection<i32>,
+{
+    assert_eq!(collection.len(), 0);
+
+    collection.insert(10);
+    assert_eq!(collection.len(), 1);
+
+    collection.insert(20);
+    assert_eq!(collection.len(), 2);
+
+    collection.insert(10); // Duplicate
+    assert_eq!(collection.len(), 2);
+
+    collection.delete(&10);
+    assert_eq!(collection.len(), 1);
+
+    collection.delete(&20);
+    assert_eq!(collection.len(), 0);
+
+    collection.delete(&30); // Not found
+    assert_eq!(collection.len(), 0);
+}
+
+/// Test iter operations
+pub fn test_iter_operations<C>(collection: &C)
+where
+    C: SortedCollection<i32> + Default,
+{
+    use crate::data_structures::SortedCollectionIter;
+
+    collection.insert(10);
+    collection.insert(5);
+    collection.insert(15);
+
+    // Test basic iteration
+    let iter = SortedCollectionIter::new(collection);
+    let items: Vec<_> = iter.collect();
+    assert_eq!(items, vec![5, 10, 15]);
 }

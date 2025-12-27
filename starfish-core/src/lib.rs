@@ -2,7 +2,11 @@
 
 pub mod common_tests;
 pub mod data_structures;
+pub mod guard;
 pub mod preemptive_synchronization;
+
+// Re-export guard types for convenience
+pub use guard::{DeferredGuard, DeferredRef, Guard};
 
 /*
 Task list:

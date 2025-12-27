@@ -1,18 +1,21 @@
 #[cfg(test)]
 mod stress_tests {
+    use starfish_core::DeferredGuard;
     use starfish_core::data_structures::SplitOrderedHashMap;
-    use starfish_core::data_structures::hash::SafeHashMapCollection;
-    use starfish_core::data_structures::wrappers::DeferredHashMap;
+    use starfish_core::data_structures::hash::HashMapCollection;
 
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant};
 
+    // Type alias for cleaner test code
+    type DeferredHashMap<K, V> = SplitOrderedHashMap<K, V, DeferredGuard>;
+
     #[test]
     fn test_stress_high_contention_single_key() {
         // Multiple threads hammering the same key
-        let map = Arc::new(DeferredHashMap::new(SplitOrderedHashMap::new()));
+        let map: Arc<DeferredHashMap<usize, usize>> = Arc::new(SplitOrderedHashMap::new());
         let num_threads = 32;
         let ops_per_thread = 100_000;
         let key = 42;
@@ -44,7 +47,7 @@ mod stress_tests {
     #[test]
     fn test_stress_thundering_herd() {
         // All threads start exactly at the same time
-        let map = Arc::new(DeferredHashMap::new(SplitOrderedHashMap::new()));
+        let map: Arc<DeferredHashMap<usize, usize>> = Arc::new(SplitOrderedHashMap::new());
         let num_threads = 64;
         let barrier = Arc::new(Barrier::new(num_threads));
         let ops_per_thread = 5000;
@@ -90,7 +93,7 @@ mod stress_tests {
     #[test]
     fn test_stress_consistency_verification() {
         // Verify that values remain consistent under concurrent updates
-        let map = Arc::new(DeferredHashMap::new(SplitOrderedHashMap::new()));
+        let map: Arc<DeferredHashMap<usize, usize>> = Arc::new(SplitOrderedHashMap::new());
         let num_threads = 16;
         let num_keys = 100;
         let updates_per_key = 1000;
@@ -130,7 +133,7 @@ mod stress_tests {
         // Verify that all increments are accounted for
         for i in 0..num_keys {
             let expected = counters[i].load(Ordering::Relaxed);
-            let actual = map.get(&i).map(|g| *g).unwrap_or(0);
+            let actual = map.get(&i).unwrap_or(0);
 
             // Due to race conditions, actual might be less than expected
             // but should never be more
@@ -147,7 +150,7 @@ mod stress_tests {
     #[test]
     fn test_stress_memory_ordering() {
         // Test that memory ordering is correct
-        let map = Arc::new(DeferredHashMap::new(SplitOrderedHashMap::new()));
+        let map: Arc<DeferredHashMap<usize, usize>> = Arc::new(SplitOrderedHashMap::new());
         let flag = Arc::new(AtomicBool::new(false));
         let value = Arc::new(AtomicUsize::new(0));
 
@@ -169,7 +172,7 @@ mod stress_tests {
             }
 
             // If we see the flag, we must see the map update
-            assert_eq!(map.get(&1).map(|g| *g), Some(100));
+            assert_eq!(map.get(&1), Some(100));
 
             // And we must see the value update
             assert_eq!(value.load(Ordering::Acquire), 42);
@@ -182,7 +185,7 @@ mod stress_tests {
     #[test]
     fn test_stress_rapid_resize() {
         // Force many resize operations
-        let map = Arc::new(DeferredHashMap::new(SplitOrderedHashMap::new()));
+        let map: Arc<DeferredHashMap<usize, usize>> = Arc::new(SplitOrderedHashMap::new());
         let num_threads = 1;
         let num_insertions = 100000;
 
@@ -209,14 +212,14 @@ mod stress_tests {
 
         // Spot check some values
         for i in (0..num_threads * num_insertions).step_by(1000) {
-            assert_eq!(map.get(&i).map(|g| *g), Some(i * i));
+            assert_eq!(map.get(&i), Some(i * i));
         }
     }
 
     #[test]
     fn test_stress_insert_or_update_intensive() {
         // Specifically test insert under stress (note: DeferredHashMap::insert returns bool, not old value)
-        let map = Arc::new(DeferredHashMap::new(SplitOrderedHashMap::new()));
+        let map: Arc<DeferredHashMap<usize, usize>> = Arc::new(SplitOrderedHashMap::new());
         let num_threads = 32;
         let num_keys = 50;
         let updates_per_thread = 10000;
@@ -258,7 +261,7 @@ mod stress_tests {
                 "Key {}: {} successful inserts, final value: {:?}",
                 i,
                 insert_counts[i].load(Ordering::Relaxed),
-                map.get(&i).map(|g| *g)
+                map.get(&i)
             );
         }
     }
@@ -276,7 +279,8 @@ mod stress_tests {
             }
         }
 
-        let map = Arc::new(DeferredHashMap::new(SplitOrderedHashMap::new()));
+        let map: Arc<SplitOrderedHashMap<BadHashKey, usize, DeferredGuard>> =
+            Arc::new(SplitOrderedHashMap::new());
         let num_threads = 16;
         let keys_per_thread = 1000;
 
@@ -305,7 +309,7 @@ mod stress_tests {
     #[test]
     fn test_stress_long_running_chaos() {
         // Run for a fixed duration with random operations
-        let map = Arc::new(DeferredHashMap::new(SplitOrderedHashMap::new()));
+        let map: Arc<DeferredHashMap<usize, usize>> = Arc::new(SplitOrderedHashMap::new());
         let num_threads = 48;
         let duration = Duration::from_secs(5);
         let stop_flag = Arc::new(AtomicBool::new(false));

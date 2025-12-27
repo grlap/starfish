@@ -1,6 +1,5 @@
 use std::cell::UnsafeCell;
 use std::future::Future;
-use std::mem;
 use std::ops::Index;
 use std::ptr;
 use std::sync::atomic::{self, AtomicPtr};
@@ -61,9 +60,17 @@ impl Coordinator {
 
         let io_manager_create_options: Arc<T> = Arc::new(io_manager_create_options);
 
-        // Initialize Reactors array.
+        // Reserve capacity for reactors. Each thread will write directly to its slot.
+        // We use set_len to avoid creating placeholder reactors that would need to be dropped.
         //
-        self.reactors = (0..reactor_count).map(|_| Reactor::default()).collect();
+        self.reactors = Vec::with_capacity(reactor_count);
+        // SAFETY: Each slot will be initialized exactly once by its corresponding thread
+        // before any reads occur. The countdown_init barrier ensures all slots are written
+        // before any thread proceeds to use them.
+        #[allow(clippy::uninit_vec)]
+        unsafe {
+            self.reactors.set_len(reactor_count)
+        };
 
         // Run Initializers.
         //
@@ -105,19 +112,21 @@ impl Coordinator {
                             .unwrap();
 
                         // Create a Reactor and store it in the reactors vector.
-                        // Explictly ignore the old entry in the vector.
                         //
                         let mut local_reactor = Reactor::with_io_manager(io_manager);
 
-                        // Reator will continue to run if there are no futures in the queue.
+                        // Reactor will continue to run if there are no futures in the queue.
                         //
                         local_reactor.set_reactor_index(reactor_index);
                         local_reactor.set_is_in_shutdown_flag(false);
 
-                        std::mem::forget(mem::replace(
+                        // Write the reactor directly to the uninitialized slot.
+                        // SAFETY: The slot is uninitialized (set_len was called without init),
+                        // and each thread writes exactly once to its own slot.
+                        ptr::write(
                             &mut local_coordinator.reactors[reactor_index],
                             local_reactor,
-                        ));
+                        );
 
                         // Set reactor local thread instance.
                         //
@@ -190,6 +199,10 @@ impl Coordinator {
         //
         self.reactors.clear();
         self.handles.clear();
+
+        // Reset the main thread's TLS to avoid stale pointers.
+        //
+        Coordinator::reset_local_instance();
 
         Ok(())
     }

@@ -2,24 +2,30 @@
 //!
 //! Run with: cargo bench --package starfish-crossbeam --bench hash_map_benchmark
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::Criterion;
+use criterion::black_box;
+use criterion::criterion_group;
+use criterion::criterion_main;
 use mimalloc::MiMalloc;
 use std::sync::Arc;
 use std::thread;
 
 use starfish_core::data_structures::SplitOrderedHashMap;
-use starfish_core::data_structures::hash::SafeHashMapCollection;
-use starfish_crossbeam::EpochGuardedHashMap;
+use starfish_core::data_structures::hash::HashMapCollection;
+use starfish_crossbeam::EpochGuard;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
+// Type alias for convenience
+type EpochHashMap<K, V> = SplitOrderedHashMap<K, V, EpochGuard>;
 
 // ============================================================================
 // Concurrent insert benchmark
 // ============================================================================
 
 fn split_ordered_hash_table_insert(thread_count: usize, iteration_count: usize) {
-    let table = Arc::new(EpochGuardedHashMap::new(SplitOrderedHashMap::new()));
+    let table: Arc<EpochHashMap<usize, String>> = Arc::new(EpochHashMap::new());
     let mut handles = vec![];
 
     for i in 0..thread_count {
@@ -42,18 +48,9 @@ fn split_ordered_hash_table_insert(thread_count: usize, iteration_count: usize) 
     assert_eq!(table.len(), iteration_count * thread_count);
 
     // Verify some random samples
-    assert_eq!(
-        table.get(&42).map(|v| v.clone()),
-        Some("value_42".to_string())
-    );
-    assert_eq!(
-        table.get(&500).map(|v| v.clone()),
-        Some("value_500".to_string())
-    );
-    assert_eq!(
-        table.get(&999).map(|v| v.clone()),
-        Some("value_999".to_string())
-    );
+    assert!(table.contains(&42));
+    assert!(table.contains(&500));
+    assert!(table.contains(&999));
 }
 
 // ============================================================================
@@ -61,7 +58,7 @@ fn split_ordered_hash_table_insert(thread_count: usize, iteration_count: usize) 
 // ============================================================================
 
 fn split_ordered_hash_table_mixed(thread_count: usize, iteration_count: usize) {
-    let table = Arc::new(EpochGuardedHashMap::new(SplitOrderedHashMap::new()));
+    let table: Arc<EpochHashMap<usize, String>> = Arc::new(EpochHashMap::new());
 
     // Pre-populate with half the values
     for i in 0..(thread_count * iteration_count / 2) {
@@ -82,7 +79,7 @@ fn split_ordered_hash_table_mixed(thread_count: usize, iteration_count: usize) {
                     }
                     1 => {
                         // Get existing value
-                        let _ = table_clone.get(&(i / 2));
+                        let _ = table_clone.contains(&(i / 2));
                     }
                     2 => {
                         // Remove existing value
@@ -105,7 +102,7 @@ fn split_ordered_hash_table_mixed(thread_count: usize, iteration_count: usize) {
 // ============================================================================
 
 fn split_ordered_hash_table_contention(thread_count: usize, iteration_count: usize) {
-    let table = Arc::new(EpochGuardedHashMap::new(SplitOrderedHashMap::new()));
+    let table: Arc<EpochHashMap<usize, String>> = Arc::new(EpochHashMap::new());
     let key_range = 100usize;
 
     let mut handles = vec![];

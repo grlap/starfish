@@ -5,11 +5,15 @@ mod sorted_list_stress_tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use starfish_core::data_structures::{DeferredCollection, SafeSortedCollection, SortedList};
+    use starfish_core::DeferredGuard;
+    use starfish_core::data_structures::{SortedCollection, SortedList};
+
+    // Type alias for cleaner test code
+    type DeferredSortedList = SortedList<usize, DeferredGuard>;
 
     // Helper function to create a fresh list for each test
-    fn create_test_list() -> Arc<DeferredCollection<usize, SortedList<usize>>> {
-        Arc::new(DeferredCollection::new(SortedList::new()))
+    fn create_test_list() -> Arc<DeferredSortedList> {
+        Arc::new(DeferredSortedList::default())
     }
 
     #[test]
@@ -481,7 +485,8 @@ mod sorted_list_stress_tests {
 #[cfg(test)]
 mod intense_stress_tests {
     use serial_test::serial;
-    use starfish_core::data_structures::{DeferredCollection, SafeSortedCollection, SortedList};
+    use starfish_core::DeferredGuard;
+    use starfish_core::data_structures::{SortedCollection, SortedList};
 
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -489,9 +494,12 @@ mod intense_stress_tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    // Helper function to create a DeferredCollection-wrapped SortedList
-    fn create_test_list() -> Arc<DeferredCollection<usize, SortedList<usize>>> {
-        Arc::new(DeferredCollection::new(SortedList::new()))
+    // Type alias for cleaner test code
+    type DeferredSortedList = SortedList<usize, DeferredGuard>;
+
+    // Helper function to create a fresh list for each test
+    fn create_test_list() -> Arc<DeferredSortedList> {
+        Arc::new(DeferredSortedList::default())
     }
 
     #[test]

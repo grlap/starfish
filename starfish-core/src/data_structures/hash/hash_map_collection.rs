@@ -1,5 +1,7 @@
 use std::hash::Hash;
 
+use crate::guard::Guard;
+
 /// A node in a hash map collection.
 ///
 pub trait HashMapNode<K, V> {
@@ -51,7 +53,16 @@ pub trait HashMapCollection<K, V>
 where
     K: Hash + Eq,
 {
+    type Guard: Guard;
     type Node: HashMapNode<K, V>;
+
+    /// Get the shared guard instance for this collection.
+    ///
+    /// The shared guard is used for deferred destruction of removed nodes.
+    /// All deleted nodes are deferred to this guard and freed when it drops
+    /// (when the collection is dropped).
+    ///
+    fn guard(&self) -> &Self::Guard;
 
     /// Insert a key-value pair.
     /// Returns the node pointer if inserted, None if key already exists.
@@ -119,7 +130,7 @@ where
     /// Remove a key and return its value (cloned).
     ///
     /// Note: The value is cloned because in concurrent contexts other threads
-    /// may still be reading the node. The node is deallocated separately.
+    /// may still be reading the node. The node destruction is deferred via the guard.
     ///
     fn remove(&self, key: &K) -> Option<V>
     where
@@ -127,7 +138,7 @@ where
     {
         self.remove_internal(key).map(|node| unsafe {
             let value = (*node).value().expect("Removed node has no value").clone();
-            Self::Node::dealloc_ptr(node);
+            self.guard().defer_destroy(node, Self::Node::dealloc_ptr);
             value
         })
     }

@@ -3,6 +3,7 @@
 //! These are pub(crate) and not intended for external use.
 
 pub mod marked_ptr;
+pub mod marked_ptr_3bit;
 pub mod sorted_collection;
 
 pub(crate) use marked_ptr::MarkedPtr;
@@ -10,3 +11,4 @@ pub(crate) use marked_ptr::MarkedPtr;
 pub use sorted_collection::CollectionNode;
 pub use sorted_collection::NodePosition;
 pub use sorted_collection::SortedCollection;
+pub use sorted_collection::SortedCollectionIter;

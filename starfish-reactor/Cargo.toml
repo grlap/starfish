@@ -42,3 +42,7 @@ rstest = "0.18"
 [[bench]]
 name = "reactor_benchmark"
 harness = false
+
+[[bench]]
+name = "lock_benchmark"
+harness = false

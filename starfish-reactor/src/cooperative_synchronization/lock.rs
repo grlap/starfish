@@ -21,11 +21,11 @@
 //!   Task wants lock
 //!         │
 //!         ▼
-//!   ┌─────────────┐     yes    ┌───────────────────┐
-//!   │ try_acquire ├───────────►│ Lock acquired!    │
-//!   └──────┬──────┘            │ Return immediately│
-//!          │ no                └───────────────────┘
-//!          ▼
+//!   ┌───────────────────┐     yes    ┌───────────────────┐
+//!   │ try_acquire_owner ├───────────►│ Lock acquired!    │
+//!   └────────┬──────────┘            │ Return immediately│
+//!            │ no                    └───────────────────┘
+//!            ▼
 //!   ┌─────────────────────────┐
 //!   │ Create waiter (signaler)│
 //!   │ Push to waiting queue   │
@@ -33,7 +33,7 @@
 //!               │
 //!               ▼
 //!   ┌─────────────────────────┐     yes    ┌─────────────────────┐
-//!   │ try_acquire again       ├───────────►│ Won race! But we    │
+//!   │ try_acquire_owner again ├───────────►│ Won race! But we    │
 //!   │ (race condition check)  │            │ have signaler queued│
 //!   └───────────┬─────────────┘            │ Call release() so   │
 //!               │ no                       │ we receive ownership│
@@ -72,11 +72,27 @@
 //!     │             │
 //!     ▼             ▼
 //!   ┌─────────┐   ┌──────────────────┐
-//!   │signal() │   │ has_owner = false│
-//!   │(transfer│   │ Lock is free     │
-//!   │ownership│   └──────────────────┘
-//!   └─────────┘
-//!       │
+//!   │signal() │   │ release_owner()  │
+//!   │(transfer│   │ has_owner = false│
+//!   │ownership│   └────────┬─────────┘
+//!   └─────────┘            │
+//!       │                  ▼
+//!       │         ┌────────────────────────┐
+//!       │         │ RACE FIX: Check queue  │
+//!       │         │ again for late arrivals│
+//!       │         └────────┬───────────────┘
+//!       │                  │
+//!       │           ┌──────┴──────┐
+//!       │           │             │
+//!       │           ▼             ▼
+//!       │         Waiter        No waiter
+//!       │         arrived         │
+//!       │           │             ▼
+//!       │           ▼           Done
+//!       │    ┌──────────────┐
+//!       │    │try_acquire   │
+//!       │    │& signal if ok│
+//!       │    └──────────────┘
 //!       ▼
 //!   ┌─────────────────────────┐
 //!   │ Waiter wakes up and     │
@@ -84,6 +100,70 @@
 //!   │ (has_owner stays TRUE)  │
 //!   └─────────────────────────┘
 //! ```
+//!
+//! ## Race Condition in Release
+//!
+//! Without the "RACE FIX" step above, a race exists:
+//!
+//! ```text
+//!   Thread A (releasing):              Thread B (acquiring):
+//!   1. pop queue → empty
+//!                                      1. try_acquire_owner → false (owned)
+//!                                      2. push signaler to queue
+//!                                      3. try_acquire_owner → false (still owned)
+//!   2. release_owner()
+//!                                      4. cooperative_wait() ← HANGS FOREVER!
+//! ```
+//!
+//! Thread B pushed after A drained but before A released. B waits forever.
+//! The fix: after releasing, check queue again and re-acquire if needed.
+//!
+//! ## Release Flow (UnfairLock / ReactorAwareLock)
+//!
+//! These locks use a two-phase approach with a RefCell for waiter selection:
+//!
+//! ```text
+//!   Owner calls release (via Drop)
+//!         │
+//!         ▼
+//!   ┌─────────────────────────────┐
+//!   │ Drain SegQueue → Vec        │
+//!   │ (move waiters to local vec) │
+//!   └───────────┬─────────────────┘
+//!               │
+//!        ┌──────┴──────┐
+//!        │             │
+//!        ▼             ▼
+//!      Waiter       No waiter
+//!      exists       in vec
+//!        │             │
+//!        ▼             ▼
+//!   ┌──────────┐   ┌──────────────────┐
+//!   │ Select   │   │ release_owner()  │
+//!   │ waiter & │   │ has_owner = false│
+//!   │ signal() │   └────────┬─────────┘
+//!   └──────────┘            │
+//!                           ▼
+//!                  ┌────────────────────────┐
+//!                  │ RACE FIX: Check        │
+//!                  │ SegQueue for arrivals  │
+//!                  └────────┬───────────────┘
+//!                           │
+//!                    ┌──────┴──────┐
+//!                    │             │
+//!                    ▼             ▼
+//!                  Waiter        Empty
+//!                  arrived         │
+//!                    │             ▼
+//!                    ▼           Done
+//!             ┌──────────────┐
+//!             │try_acquire & │
+//!             │release()     │
+//!             │(recursive)   │
+//!             └──────────────┘
+//! ```
+//!
+//! The recursive call re-drains the SegQueue and processes the new waiter.
 //!
 //! # Lock Types
 //!
@@ -159,7 +239,7 @@ impl LockSync {
     }
 
     #[must_use]
-    pub(self) fn try_acquire(&self) -> bool {
+    pub(self) fn try_acquire_owner(&self) -> bool {
         let has_owner = self.has_owner.load(Ordering::Relaxed);
         match has_owner {
             true => false,
@@ -173,7 +253,7 @@ impl LockSync {
         }
     }
 
-    pub(self) fn release(&self) {
+    pub(self) fn release_owner(&self) {
         self.has_owner.store(false, Ordering::Release);
     }
 }
@@ -186,7 +266,7 @@ trait LockExt<T: ?Sized>: Lock<T> {
     async fn acquire_internal(&self, lock_sync: &LockSync) {
         // Try to acquire the lock directly.
         //
-        if lock_sync.try_acquire() {
+        if lock_sync.try_acquire_owner() {
             return;
         }
 
@@ -198,13 +278,14 @@ trait LockExt<T: ?Sized>: Lock<T> {
         // Handle race condition: the lock might have been released between our
         // try_acquire and pushing to the queue. Try again.
         //
-        if lock_sync.try_acquire() {
+        if lock_sync.try_acquire_owner() {
             // We won the race and acquired the lock directly.
-            // But we also have a signaler in the queue that might get signaled.
-            // Release the lock to maintain the invariant (signaler in queue = waiting).
-            // We'll receive ownership back via signal.
+            // Pop the first waiter and signal them (transfers ownership).
+            // This might be us or someone else - either way, we wait for signal.
             //
-            self.release();
+            if let Some(waiter) = lock_sync.external_waiting_futures.pop() {
+                waiter.signal();
+            }
         }
 
         // Wait for signal. When we wake up, we own the lock.
@@ -258,7 +339,7 @@ impl<T> FairLock<T> {
 
     #[must_use]
     pub fn try_acquire(&self) -> Option<LockResult<'_, T>> {
-        match self.lock_sync.try_acquire() {
+        match self.lock_sync.try_acquire_owner() {
             true => Some(LockResult {
                 lock: self,
                 data: unsafe { &mut *self.data.get() },
@@ -284,13 +365,27 @@ impl<T: ?Sized> Lock<T> for FairLock<T> {
         // re-entrancy issues. signal() can synchronously wake a task on the
         // same thread, which may then call release() again.
         //
-        let signaler_to_wake = match self.lock_sync.external_waiting_futures.pop() {
-            Some(wait_one) => Some(wait_one),
-            None => {
-                // No waiters, set lock as not acquired.
-                //
-                self.lock_sync.release();
-                None
+        let signaler_to_wake = loop {
+            match self.lock_sync.external_waiting_futures.pop() {
+                Some(wait_one) => break Some(wait_one),
+                None => {
+                    // No waiters, release ownership.
+                    //
+                    self.lock_sync.release_owner();
+
+                    // RACE FIX: A waiter may have pushed after we checked the queue
+                    // but before we released ownership. If queue is not empty,
+                    // re-acquire and let the loop handle it.
+                    //
+                    if self.lock_sync.external_waiting_futures.is_empty() {
+                        break None;
+                    }
+                    if !self.lock_sync.try_acquire_owner() {
+                        // Someone else acquired - they'll handle the waiters.
+                        break None;
+                    }
+                    // Re-acquired! Loop back to pop and signal.
+                }
             }
         };
 
@@ -348,7 +443,7 @@ impl<T> UnfairLock<T> {
 
     #[must_use]
     pub fn try_acquire(&self) -> Option<LockResult<'_, T>> {
-        match self.lock_sync.try_acquire() {
+        match self.lock_sync.try_acquire_owner() {
             true => Some(LockResult {
                 lock: self,
                 data: unsafe { &mut *self.data.get() },
@@ -404,7 +499,21 @@ impl<T: Sized> Lock<T> for UnfairLock<T> {
         //
         match signaler_to_wake {
             Some(signaler) => signaler.signal(),
-            None => self.lock_sync.release(),
+            None => {
+                self.lock_sync.release_owner();
+
+                // RACE FIX: A waiter may have pushed after we checked the queue
+                // but before we released ownership. If queue is not empty,
+                // re-acquire and signal a waiter.
+                //
+                if !self.lock_sync.external_waiting_futures.is_empty()
+                    && self.lock_sync.try_acquire_owner()
+                {
+                    // Re-acquired! Call release recursively to handle the waiter.
+                    self.release();
+                }
+                // else: Someone else acquired - they'll handle the waiters.
+            }
         }
     }
 }
@@ -460,7 +569,7 @@ impl<T> ReactorAwareLock<T> {
 
     #[must_use]
     pub fn try_acquire(&self) -> Option<LockResult<'_, T>> {
-        match self.lock_sync.try_acquire() {
+        match self.lock_sync.try_acquire_owner() {
             true => Some(LockResult {
                 lock: self,
                 data: unsafe { &mut *self.data.get() },
@@ -544,7 +653,21 @@ impl<T: Sized> Lock<T> for ReactorAwareLock<T> {
         //
         match signaler_to_wake {
             Some(signaler) => signaler.signal(),
-            None => self.lock_sync.release(),
+            None => {
+                self.lock_sync.release_owner();
+
+                // RACE FIX: A waiter may have pushed after we checked the queue
+                // but before we released ownership. If queue is not empty,
+                // re-acquire and signal a waiter.
+                //
+                if !self.lock_sync.external_waiting_futures.is_empty()
+                    && self.lock_sync.try_acquire_owner()
+                {
+                    // Re-acquired! Call release recursively to handle the waiter.
+                    self.release();
+                }
+                // else: Someone else acquired - they'll handle the waiters.
+            }
         }
     }
 }

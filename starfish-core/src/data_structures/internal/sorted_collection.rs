@@ -1,4 +1,6 @@
 use crate::data_structures::ordered_iterator::OrderedIterator;
+use crate::guard::Guard;
+use std::marker::PhantomData;
 use std::ptr;
 
 pub trait CollectionNode<T> {
@@ -65,7 +67,28 @@ pub trait NodePosition<T>: Clone {
 
 /// A trait for sorted collections that maintain elements in order.
 ///
+/// # Type Parameters
+///
+/// - `T`: The element type (must be `Eq + Ord`)
+///
+/// # Associated Types
+///
+/// - `Guard`: The memory reclamation guard type (e.g., `EpochGuard`, `DeferredGuard`)
+///
+/// # Design
+///
+/// This trait combines low-level internal methods (for algorithm implementation)
+/// with high-level safe methods (for user code). The guard type determines
+/// the memory reclamation strategy:
+///
+/// ```text
+/// SortedList<i32, EpochGuard>      - Production: epoch-based reclamation
+/// SortedList<i32, DeferredGuard>   - Testing: deferred destruction
+/// SkipList<i64, EpochGuard>        - Skip list with epoch-based reclamation
+/// ```
+///
 pub trait SortedCollection<T: Eq + Ord> {
+    type Guard: Guard;
     type Node: CollectionNode<T>;
     type NodePosition: NodePosition<T, Node = Self::Node>;
 
@@ -155,53 +178,156 @@ pub trait SortedCollection<T: Eq + Ord> {
         self.insert_from_internal(key, position)
     }
 
-    // Methods.
-    //
+    /// Get the shared guard instance for this collection.
+    ///
+    /// The shared guard is used for deferred destruction of removed nodes.
+    /// All deleted nodes are deferred to this guard and freed when it drops
+    /// (when the collection is dropped).
+    ///
+    fn guard(&self) -> &Self::Guard;
 
+    // =========================================================================
+    // Safe Public API (uses guard for memory safety)
+    // =========================================================================
+
+    /// Insert a value into the collection.
+    ///
+    /// Returns `true` if the value was inserted, `false` if it already exists.
+    ///
+    fn insert(&self, key: T) -> bool {
+        let _guard = Self::Guard::pin();
+        self.insert_from_internal(key, None).is_some()
+    }
+
+    /// Remove a value from the collection.
+    ///
+    /// Returns `true` if the value was removed, `false` if not found.
+    ///
+    fn delete(&self, key: &T) -> bool {
+        let _guard = Self::Guard::pin();
+        if let Some(pos) = self.remove_from_internal(None, key) {
+            unsafe {
+                self.guard()
+                    .defer_destroy(pos.node_ptr(), Self::Node::dealloc_ptr);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove and return the value if it exists.
+    ///
+    /// Returns `Some(value)` if found and removed, `None` if not found.
+    ///
+    fn remove(&self, key: &T) -> Option<T>
+    where
+        T: Clone,
+    {
+        let _guard = Self::Guard::pin();
+        let pos = self.remove_from_internal(None, key)?;
+        let node_ptr = pos.node_ptr();
+
+        // Clone the value before scheduling destruction
+        let data = self.apply_on_internal(node_ptr, |entry| entry.clone());
+
+        unsafe {
+            self.guard()
+                .defer_destroy(node_ptr, Self::Node::dealloc_ptr);
+        }
+
+        data
+    }
+
+    /// Update a value in the collection atomically.
+    ///
+    /// If the value exists (by `Eq`), replaces the node and returns `true`.
+    /// If the value does not exist, returns `false` and does nothing.
+    ///
+    fn update(&self, new_value: T) -> bool {
+        let _guard = Self::Guard::pin();
+        if let Some((old_node_ptr, _new_pos)) = self.update_internal(None, new_value) {
+            unsafe {
+                self.guard()
+                    .defer_destroy(old_node_ptr, Self::Node::dealloc_ptr);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check if a value exists in the collection.
+    ///
     fn contains(&self, key: &T) -> bool {
+        let _guard = Self::Guard::pin();
         self.find_from_internal(None, key, true).is_some()
     }
 
-    /// Insert a value into the collection.
-    /// Returns true if inserted, false if the value already exists.
+    /// Find and return a guarded reference to the value.
     ///
-    fn insert(&self, value: T) -> bool {
-        self.insert_from_internal(value, None).is_some()
+    /// Returns a guarded reference that protects the value according to
+    /// the guard's memory reclamation strategy.
+    ///
+    fn find(&self, key: &T) -> Option<<Self::Guard as Guard>::GuardedRef<'_, T>> {
+        let _guard = Self::Guard::pin();
+        let pos = self.find_from_internal(None, key, true)?;
+
+        let data_ptr = self.apply_on_internal(pos.node_ptr(), |entry| entry as *const T)?;
+
+        // Safety: The guard protects this access, make_ref creates its own guard
+        unsafe { Some(Self::Guard::make_ref(data_ptr)) }
     }
 
-    /// Insert a value into the collection after a given position.
-    /// Returns true if inserted, false if the value already exists.
-    ///
-    fn insert_from(&self, position: &Self::NodePosition, key: T) -> bool {
-        self.insert_from_internal(key, Some(position)).is_some()
-    }
-
-    /// Find a value and apply a function to it, returning the result.
+    /// Find a value and apply a function to it.
     ///
     fn find_and_apply<F, R>(&self, key: &T, f: F) -> Option<R>
     where
         F: FnOnce(&T) -> R,
     {
+        let _guard = Self::Guard::pin();
         match self.find_from_internal(None, key, true) {
             Some(pos) => self.apply_on_internal(pos.node_ptr(), f),
             None => None,
         }
     }
 
-    fn find_from(&self, position: &Self::NodePosition, key: &T) -> Option<Self::NodePosition> {
-        self.find_from_internal(Some(position), key, true)
+    /// Check if the collection is empty.
+    ///
+    fn is_empty(&self) -> bool {
+        let _guard = Self::Guard::pin();
+        self.first_node_internal().is_none()
     }
 
-    /// Find a value and apply a function to it from a starting position, returning the result.
+    /// Collects all elements into a Vec.
     ///
-    fn find_from_and_apply<F, R>(&self, position: &Self::NodePosition, key: &T, f: F) -> Option<R>
+    fn to_vec(&self) -> Vec<T>
     where
-        F: FnOnce(&T) -> R,
+        T: Clone,
     {
-        match self.find_from_internal(Some(position), key, true) {
-            Some(pos) => self.apply_on_internal(pos.node_ptr(), f),
-            None => None,
+        let _guard = Self::Guard::pin();
+        let mut result = Vec::new();
+        let mut current = self.first_node_internal();
+        while let Some(node) = current {
+            unsafe {
+                result.push((*node).key().clone());
+            }
+            current = self.next_node_internal(node);
         }
+        result
+    }
+
+    /// Returns the number of elements in the collection.
+    ///
+    fn len(&self) -> usize {
+        let _guard = Self::Guard::pin();
+        let mut count = 0;
+        let mut current = self.first_node_internal();
+        while current.is_some() {
+            count += 1;
+            current = self.next_node_internal(current.unwrap());
+        }
+        count
     }
 
     /// Insert multiple values in batch from an ordered iterator.
@@ -217,6 +343,7 @@ pub trait SortedCollection<T: Eq + Ord> {
     where
         I: OrderedIterator<Item = T>,
     {
+        let _guard = Self::Guard::pin();
         let mut count = 0;
         let mut last_position: Option<Self::NodePosition> = None;
 
@@ -229,5 +356,77 @@ pub trait SortedCollection<T: Eq + Ord> {
             // as hint - the next value will still be >= that position
         }
         count
+    }
+}
+
+// ============================================================================
+// Iterator Support
+// ============================================================================
+
+/// Iterator over a sorted collection with guard protection.
+///
+/// This iterator holds a read guard for the duration of iteration,
+/// ensuring memory safety. For epoch-based guards, this pins the thread.
+/// For deferred guards, this is a no-op since the collection's guard
+/// provides protection.
+///
+pub struct SortedCollectionIter<'a, T, C>
+where
+    C: SortedCollection<T>,
+    T: Eq + Ord,
+{
+    _guard: <C::Guard as Guard>::ReadGuard,
+    collection: &'a C,
+    current_node: Option<*mut C::Node>,
+    _phantom: PhantomData<T>,
+}
+
+impl<'a, T, C> SortedCollectionIter<'a, T, C>
+where
+    C: SortedCollection<T>,
+    T: Eq + Ord,
+{
+    /// Create a new iterator over the collection.
+    pub fn new(collection: &'a C) -> Self {
+        let guard = C::Guard::pin();
+        let first = collection.first_node_internal();
+        Self {
+            _guard: guard,
+            collection,
+            current_node: first,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Create an iterator starting from a specific node.
+    pub fn from_node(collection: &'a C, node: Option<*mut C::Node>) -> Self {
+        let guard = C::Guard::pin();
+        Self {
+            _guard: guard,
+            collection,
+            current_node: node,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<'a, T, C> Iterator for SortedCollectionIter<'a, T, C>
+where
+    C: SortedCollection<T>,
+    T: Eq + Ord + Clone,
+{
+    // Note: We return cloned values instead of GuardedRef because the lifetime
+    // of GuardedRef would need to be tied to the guard, which we move into the
+    // iterator. This is a simpler API that works for most use cases.
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let node = self.current_node?;
+
+        // Get next node before returning current
+        self.current_node = self.collection.next_node_internal(node);
+
+        // Clone the value (safe because read guard protects access)
+        unsafe { Some((*node).key().clone()) }
     }
 }

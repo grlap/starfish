@@ -12,47 +12,24 @@ Both sorted collections and hash maps follow the same pattern:
 │                           USER-FACING API (Safe)                        │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
-│   ┌─────────────────────────┐         ┌─────────────────────────┐       │
-│   │  SafeSortedCollection   │         │  SafeHashMapCollection  │       │
-│   │        (trait)          │         │        (trait)          │       │
-│   │                         │         │                         │       │
-│   │  • insert(T)            │         │  • insert(K, V)         │       │
-│   │  • delete(&T)           │         │  • remove(&K) -> V      │       │
-│   │  • find(&T) -> GuardRef │         │  • get(&K) -> GuardRef  │       │
-│   │  • contains(&T)         │         │  • contains(&K)         │       │
-│   │  • update(T)            │         │  • find_and_apply(...)  │       │
-│   └───────────┬─────────────┘         └───────────┬─────────────┘       │
-│               │                                   │                     │
-└───────────────┼───────────────────────────────────┼─────────────────────┘
-                │ implemented by                    │ implemented by
-                ▼                                   ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        MEMORY-SAFE WRAPPERS                             │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
 │   ┌─────────────────────────────┐     ┌─────────────────────────────┐   │
 │   │   EpochGuardedCollection    │     │    EpochGuardedHashMap      │   │
 │   │        (struct)             │     │        (struct)             │   │
 │   │   [starfish-crossbeam]      │     │   [starfish-crossbeam]      │   │
 │   │                             │     │                             │   │
+│   │  • insert(T)                │     │  • insert(K, V)             │   │
+│   │  • delete(&T)               │     │  • remove(&K) -> V          │   │
+│   │  • find(&T) -> GuardRef     │     │  • get(&K) -> GuardRef      │   │
+│   │  • contains(&T)             │     │  • contains(&K)             │   │
+│   │  • update(T)                │     │  • find_and_apply(...)      │   │
 │   │  • Epoch-based reclamation  │     │  • Epoch-based reclamation  │   │
-│   │  • Production use           │     │  • Production use           │   │
-│   └─────────────┬───────────────┘     └─────────────┬───────────────┘   │
-│                 │                                   │                   │
-│   ┌─────────────┴───────────────┐     ┌─────────────┴───────────────┐   │
-│   │     DeferredCollection      │     │      DeferredHashMap        │   │
-│   │        (struct)             │     │        (struct)             │   │
-│   │   [starfish-core]           │     │   [starfish-core]           │   │
-│   │                             │     │                             │   │
-│   │  • Deferred destruction     │     │  • Deferred destruction     │   │
-│   │  • Testing only             │     │  • Testing only             │   │
 │   └─────────────┬───────────────┘     └─────────────┬───────────────┘   │
 │                 │                                   │                   │
 └─────────────────┼───────────────────────────────────┼───────────────────┘
                   │ wraps                             │ wraps
                   ▼                                   ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                      INTERNAL LOW-LEVEL TRAITS                          │
+│                      LOW-LEVEL TRAITS                                   │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │   ┌─────────────────────────┐         ┌─────────────────────────┐       │
@@ -83,20 +60,12 @@ Both sorted collections and hash maps follow the same pattern:
 │   │  Lock-free    │  │  Lock-free    │  │  Uses SortedList inside   │   │
 │   └───────────────┘  └───────────────┘  └───────────────────────────┘   │
 │                                                                         │
-│   ┌───────────────────────────┐                                         │
-│   │   SkipListBacklinks       │                                         │
-│   │        (struct)           │                                         │
-│   │                           │                                         │
-│   │  O(log n), backlinks      │                                         │
-│   │  Atomic UPDATE support    │                                         │
-│   └───────────────────────────┘                                         │
-│                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Key Design Principles
 
-1. **Users only interact with Safe*Collection traits** - no raw pointers exposed
+1. **Users interact with EpochGuardedCollection/HashMap** - no raw pointers exposed
 2. **Memory-safe wrappers** convert unsafe internal operations to safe APIs
 3. **GuardedRef** bundles epoch guards with references to prevent use-after-free
 4. **Two wrapper options**:
@@ -107,7 +76,7 @@ Both sorted collections and hash maps follow the same pattern:
 
 ```rust
 // PRODUCTION: Sorted collection with epoch-based reclamation
-let list = EpochGuardedCollection::new(SkipListBacklinks::new());
+let list = EpochGuardedCollection::new(SkipList::new());
 list.insert(42);
 
 // PRODUCTION: Hash map with epoch-based reclamation
@@ -154,31 +123,6 @@ pub trait SortedCollection<T: Eq + Ord> {
 The `NodePosition` trait stores predecessors at ALL levels, enabling O(1) amortized batch inserts
 for sorted data. This optimization is similar to RocksDB's "splice" pattern for MemTable inserts.
 
-### SafeSortedCollection (High-Level)
-
-The `SafeSortedCollection` trait provides a safe, user-facing API. It wraps `SortedCollection` implementations with memory safety guarantees.
-
-```rust
-pub trait SafeSortedCollection<T: Eq + Ord> {
-    type GuardedRef<'a>: Deref<Target = T>;
-    type Iter<'a>: Iterator<Item = Self::GuardedRef<'a>>;
-
-    // Safe operations
-    fn insert(&self, key: T) -> bool;
-    fn delete(&self, key: &T) -> bool;
-    fn remove(&self, key: &T) -> Option<T>;
-    fn update(&self, new_value: T) -> bool;
-    fn contains(&self, key: &T) -> bool;
-    fn find(&self, key: &T) -> Option<Self::GuardedRef<'_>>;
-
-    // Iteration
-    fn iter(&self) -> Self::Iter<'_>;
-    fn iter_from(&self, start_key: &T) -> Self::Iter<'_>;
-    fn to_vec(&self) -> Vec<T>;
-    fn len(&self) -> usize;
-}
-```
-
 ### Atomic Update Operation (UPDATE_MARK)
 
 The `update_internal` method provides atomic in-place updates using marked pointers.
@@ -187,29 +131,6 @@ The `update_internal` method provides atomic in-place updates using marked point
 - `find_from_internal` only returns nodes available in the current epoch (unmarked nodes)
 - Any marked nodes are always physically unlinked before `remove_internal` returns
 - Readers never see "half-updated" state - either old value or new value
-
-**Algorithm (SkipListBacklinks - Mark-then-Insert):**
-```
-Before: preds[0] → curr → succ
-Goal:   preds[0] → new_node → succ (curr orphaned)
-
-Step 1: Unlink higher levels (mark + unlink curr at levels 1..height)
-        After: curr only linked at level 0
-
-Step 2: Mark curr.next[0] with UPDATE_MARK (ownership)
-        curr.next[0] still points to succ (just marked)
-        After: preds[0] → curr(UPDATE) → succ
-
-Step 3: Insert new_node (sees curr as marked/deleted, inserts at same position)
-        After: preds[0] → new_node → succ
-               curr is orphaned (insert unlinked it)
-```
-
-**Why this works:**
-- `curr.next[0]` points to `succ` (a valid node in the list), NOT to `new_node`
-- If `curr` gets freed (epoch advances), readers following `curr.next[0]` still get a valid node
-- The new value is found through normal traversal, not by following `curr`
-- Insert sees `curr` as UPDATE-marked (treated like DELETE-marked) and replaces it
 
 **Algorithm (SortedList - Forward Insertion):**
 1. Find the node `curr` with the target key
@@ -222,7 +143,7 @@ Step 3: Insert new_node (sees curr as marked/deleted, inserts at same position)
 **Interaction with DELETE:**
 - Both DELETE_MARK and UPDATE_MARK use the low bits of the next pointer
 - `find_from_internal` checks `is_any_marked()` to skip both DELETE and UPDATE marked nodes
-- `remove_from_internal` checks `is_any_marked()` for ownership - first thread to mark level 0 wins
+- `remove_from_internal` checks `is_any_marked()` for ownership - first thread to mark the node wins
 - Marked nodes are fully unlinked before the function returns
 
 **Implementation Status:**
@@ -230,7 +151,6 @@ Step 3: Insert new_node (sees curr as marked/deleted, inserts at same position)
 |----------------|-----------------|
 | SortedList | ✅ Atomic UPDATE_MARK (forward insertion) |
 | SkipList | ✅ Atomic UPDATE_MARK (forward insertion) |
-| SkipListBacklinks | ✅ Atomic UPDATE_MARK (mark-then-insert) |
 
 ### Insert-or-Update Pattern (SplitOrderedHashMap)
 
@@ -309,12 +229,10 @@ Lock-free sorted linked list using Harris's algorithm with marked pointers for d
 
 ```
 Forward:   Head ──► [1] ──► [3] ──► [5] ──► [7] ──► NULL
-Backlinks: Head ◄── [1] ◄── [3] ◄── [5] ◄── [7]  (set before marking for DELETE/UPDATE)
 ```
 
 **Characteristics:**
 - O(n) search, insert, delete
-- Backlinks for recovery from marked starting nodes
 - Good for small collections or when used with split-ordered hashing
 - **Batch insert optimization**: 6-7x faster for sorted batch inserts (transforms O(n²) → O(n))
 
@@ -387,7 +305,7 @@ When finding predecessors to delete node X:
 - Ownership is determined by which thread successfully marks level 0 (with DELETE_MARK or UPDATE_MARK)
 - Any thread can help unlink higher levels (cooperative)
 - Only the owner unlinks level 0 and returns the node
-- Recovery from marked predecessors uses preds[level+1], not backlinks
+- Recovery from marked predecessors uses preds[level+1]
 
 **Recovery via preds[level+1]:**
 When a predecessor at level L is marked, use the predecessor from level L+1:
@@ -413,7 +331,7 @@ fn recover_pred(&self, level: usize, preds: &[*mut SkipNode<T>]) -> *mut SkipNod
 - Compatible with split-ordered hashmap bucket sentinels as start nodes
 
 **SkipList (with Level-Based Recovery): preds[level+1]-based Recovery**
-- No backlinks stored in nodes (memory efficient)
+- Memory efficient (no backward pointers needed)
 - Recovery uses predecessors from higher levels in the preds array
 - Expected O(1) - typically only need to go up one level
 - Worst case O(log n) if many levels have stale preds
@@ -510,20 +428,65 @@ The hint is only used if:
 
 If any check fails, we fall back to normal O(log n) traversal from HEAD.
 
-**Benchmark Results:**
+**Batch Insert Benchmark Results:**
 | Implementation | Size | Batch Time | Individual Time | Improvement |
 |----------------|------|------------|-----------------|-------------|
-| SortedList | 1K | 16µs | 110µs | **-85%** |
-| SortedList | 10K | 170µs | 10.8ms | **-98%** |
+| SortedList | 1K | 14µs | 110µs | **-87%** |
+| SortedList | 10K | 150µs | 10.8ms | **-99%** |
 | SortedList | 100K | 1.7ms | 1.1s | **-99.8%** |
-| SkipList | 1K | 79µs | 88µs | -10% |
-| SkipList | 10K | 892µs | 1.0ms | -11% |
-| SkipList | 100K | 10.2ms | 10.7ms | -5% |
-| SkipListBacklinks | 1K | 90µs | 102µs | -12% |
-| SkipListBacklinks | 10K | 1.0ms | 1.2ms | -15% |
-| SkipListBacklinks | 100K | 10.7ms | 12.9ms | -17% |
+| SkipList | 1K | 109µs | 141µs | -23% |
+| SkipList | 10K | 1.1ms | 1.3ms | -15% |
+| SkipList | 100K | 12ms | 12ms | ~0% |
 
 Note: SortedList batch insert transforms O(n²) → O(n), while SkipList stays O(n log n) with better constants.
+
+### SkipList vs Crossbeam SkipMap Comparison
+
+**Concurrent Insert (1000 ops/thread, 10K elements):**
+| Threads | SkipList | Crossbeam SkipMap | Winner |
+|---------|----------|-------------------|--------|
+| 1 | 1.15 ms | 0.96 ms | Crossbeam (1.2x) |
+| 2 | 1.47 ms | 1.56 ms | **SkipList (1.06x)** |
+| 4 | 2.07 ms | 2.71 ms | **SkipList (1.31x)** |
+| 8 | 3.88 ms | 6.51 ms | **SkipList (1.68x)** |
+| 12 | 5.82 ms | 10.11 ms | **SkipList (1.74x)** |
+| 16 | 7.20 ms | 13.59 ms | **SkipList (1.89x)** |
+
+**Mixed Workload (50% insert, 25% delete, 25% lookup):**
+| Threads | SkipList | Crossbeam SkipMap | Winner |
+|---------|----------|-------------------|--------|
+| 1 | 1.56 ms | 1.19 ms | Crossbeam (1.31x) |
+| 2 | 2.61 ms | 2.33 ms | Crossbeam (1.12x) |
+| 4 | 4.35 ms | 4.16 ms | Crossbeam (1.05x) |
+| 8 | 8.40 ms | 8.89 ms | **SkipList (1.06x)** |
+| 12 | 12.08 ms | 15.06 ms | **SkipList (1.25x)** |
+| 16 | 20.36 ms | 21.98 ms | **SkipList (1.08x)** |
+
+**High Contention (same key range, 100 keys):**
+| Threads | SkipList | Crossbeam SkipMap | Winner |
+|---------|----------|-------------------|--------|
+| 1 | 0.88 ms | 1.33 ms | **SkipList (1.51x)** |
+| 2 | 1.76 ms | 4.44 ms | **SkipList (2.52x)** |
+| 4 | 1.88 ms | 6.64 ms | **SkipList (3.53x)** |
+| 8 | 5.33 ms | 13.81 ms | **SkipList (2.59x)** |
+| 12 | 3.66 ms | 18.40 ms | **SkipList (5.03x)** |
+| 16 | 4.62 ms | 24.11 ms | **SkipList (5.22x)** |
+
+**Sequential Batch Insert (single-thread):**
+| Size | SkipList | Crossbeam SkipMap | Winner |
+|------|----------|-------------------|--------|
+| 1K | 96 µs | 70 µs | Crossbeam (1.37x) |
+| 10K | 991 µs | 812 µs | Crossbeam (1.22x) |
+| 100K | 10.33 ms | 8.86 ms | Crossbeam (1.17x) |
+| 200K | 21.84 ms | 19.55 ms | Crossbeam (1.12x) |
+| 500K | 56.84 ms | 49.12 ms | Crossbeam (1.16x) |
+
+**Summary:**
+- **Low contention/single-threaded**: Crossbeam wins by ~15-30%
+- **High concurrency (4+ threads)**: SkipList wins by 1.3-1.9x on inserts
+- **High contention**: SkipList wins dramatically (2.5-5x faster)
+- SkipList excels under concurrency due to finer-grained synchronization
+- Crossbeam is more efficient for single-threaded workloads with optimized memory layout
 
 ## Memory Safety Wrappers
 
@@ -612,41 +575,31 @@ data_structures/
 │
 ├── internal/                      # Internal implementation details
 │   ├── mod.rs
-│   ├── marked_ptr.rs              # MarkedPtr for lock-free deletion
+│   ├── marked_ptr.rs              # MarkedPtr (2-bit) for lock-free deletion
+│   ├── marked_ptr_3bit.rs         # MarkedPtr (3-bit) for DELETE/UPDATE/DEL_NEXT
 │   └── sorted_collection.rs       # SortedCollection trait
 │
 ├── sorted/                        # Sorted collection implementations
 │   ├── mod.rs
 │   ├── sorted_list.rs             # SortedList (O(n) linked list)
 │   ├── skip_list.rs               # SkipList (O(log n))
-│   ├── skip_list_backlinks.rs     # SkipList with backlinks
-│   ├── safe_sorted_collection.rs  # SafeSortedCollection trait
-│   └── treap.rs                   # Treap implementation
+│   └── treap.rs                   # Treap implementation (sequential)
 │
 ├── hash/                          # Hash-based collections
 │   ├── mod.rs
 │   ├── split_ordered_hash_map.rs  # Split-ordered hash map
-│   ├── hash_map_collection.rs     # HashMapCollection trait (low-level)
-│   └── safe_hash_map_collection.rs # SafeHashMapCollection trait (user API)
+│   └── hash_map_collection.rs     # HashMapCollection trait (low-level)
 │
-├── trie/                          # Trie implementations
-│   └── mod.rs
-│
-└── wrappers/                      # Memory safety wrappers
+└── trie/                          # Trie implementations
     ├── mod.rs
-    ├── deferred_collection.rs     # DeferredCollection (sorted, testing)
-    ├── deferred_collection_iter.rs
-    └── deferred_hash_map.rs       # DeferredHashMap (hash, testing)
+    └── skip_trie.rs               # SkipTrie implementation
 ```
 
 **In starfish-crossbeam:**
 ```
 starfish-crossbeam/src/
-├── lib.rs
-├── epoch_guarded_sorted_collection.rs  # EpochGuardedCollection
-├── epoch_guarded_hash_map.rs           # EpochGuardedHashMap
-├── epoch_guarded_collection_iter.rs    # Iterator for sorted collections
-└── guarded_ref.rs                      # GuardedRef type (shared)
+├── lib.rs                         # EpochGuardedCollection, EpochGuardedHashMap
+└── epoch_guard.rs                 # EpochGuard implementation
 ```
 
 ## Usage Example
@@ -655,10 +608,10 @@ starfish-crossbeam/src/
 
 ```rust
 use starfish_crossbeam::EpochGuardedCollection;
-use starfish_core::data_structures::{SkipListBacklinks, SafeSortedCollection};
+use starfish_core::data_structures::SkipList;
 
 // Create a thread-safe sorted collection
-let collection: EpochGuardedCollection<i32, SkipListBacklinks<i32>> =
+let collection: EpochGuardedCollection<i32, SkipList<i32>> =
     EpochGuardedCollection::default();
 
 // Insert values
@@ -689,7 +642,7 @@ collection.update(5);  // Replace 5 with 5 atomically
 
 ```rust
 use starfish_crossbeam::EpochGuardedHashMap;
-use starfish_core::data_structures::{SplitOrderedHashMap, SafeHashMapCollection};
+use starfish_core::data_structures::SplitOrderedHashMap;
 
 // Create a thread-safe hash map
 let map: EpochGuardedHashMap<String, i32, SplitOrderedHashMap<String, i32>> =
@@ -718,10 +671,10 @@ assert_eq!(doubled, Some(200));
 
 ## Design Rationale
 
-1. **Separation of Concerns**: Low-level algorithms (`SortedCollection`) are separate from memory safety (`SafeSortedCollection`), allowing different reclamation strategies.
+1. **Separation of Concerns**: Low-level algorithms (`SortedCollection`) are separate from memory-safe wrappers (`EpochGuardedCollection`), allowing different reclamation strategies.
 
 2. **Encapsulation**: Internal node pointers are never exposed to users. The `inner()` method is `pub(crate)` only.
 
-3. **Extensibility**: New data structures implement `SortedCollection`, new safety strategies implement `SafeSortedCollection`.
+3. **Extensibility**: New data structures implement `SortedCollection` trait, new safety wrappers wrap them.
 
 4. **Iterator Safety**: Iterators hold guards that prevent memory reclamation during iteration.

@@ -19,35 +19,24 @@ Epoch-based memory-safe wrappers for lock-free concurrent data structures.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        USER CODE (Safe)                          │
+│                        USER CODE (Safe)                         │
 ├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│   SafeSortedCollection<T>          SafeHashMapCollection<K,V>    │
-│         (trait)                           (trait)                │
-│                                                                  │
-└──────────────┬────────────────────────────────┬─────────────────┘
-               │ implemented by                 │ implemented by
-               ▼                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   starfish-crossbeam (This Crate)               │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│   EpochGuardedCollection<T, C>    EpochGuardedHashMap<K, V, C>   │
+│                                                                 │
+│   EpochGuardedCollection<T, C>    EpochGuardedHashMap<K, V, C>  │
 │   • Epoch guard on every op       • Epoch guard on every op     │
 │   • Deferred node destruction     • Deferred node destruction   │
 │   • GuardedRef returns            • GuardedRef returns          │
-│                                                                  │
+│                                                                 │
 └──────────────┬────────────────────────────────┬─────────────────┘
                │ wraps                          │ wraps
                ▼                                ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                      starfish-core (Unsafe)                      │
+│                      starfish-core (Unsafe)                     │
 ├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│   SortedList, SkipList,           SplitOrderedHashMap            │
-│   SkipListBacklinks               (lock-free hash table)        │
-│   (lock-free sorted lists)                                       │
-│                                                                  │
+│                                                                 │
+│   SortedList, SkipList            SplitOrderedHashMap           │
+│   (lock-free sorted lists)        (lock-free hash table)        │
+│                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -57,10 +46,10 @@ Epoch-based memory-safe wrappers for lock-free concurrent data structures.
 
 ```rust
 use starfish_crossbeam::EpochGuardedCollection;
-use starfish_core::data_structures::SkipListBacklinks;
+use starfish_core::data_structures::SkipList;
 
 // Create a thread-safe sorted collection
-let list: EpochGuardedCollection<i32, SkipListBacklinks<i32>> =
+let list: EpochGuardedCollection<i32, SkipList<i32>> =
     EpochGuardedCollection::default();
 
 // Insert values (thread-safe)
@@ -129,9 +118,9 @@ let doubled = map.find_and_apply(&"alice".to_string(), |_, v| v * 2);
 use std::sync::Arc;
 use std::thread;
 use starfish_crossbeam::EpochGuardedCollection;
-use starfish_core::data_structures::SkipListBacklinks;
+use starfish_core::data_structures::SkipList;
 
-let list = Arc::new(EpochGuardedCollection::<i32, SkipListBacklinks<i32>>::default());
+let list = Arc::new(EpochGuardedCollection::<i32, SkipList<i32>>::default());
 
 let handles: Vec<_> = (0..8)
     .map(|t| {

@@ -5,6 +5,7 @@ use crate::data_structures::CollectionNode;
 use crate::data_structures::MarkedPtr;
 use crate::data_structures::NodePosition;
 use crate::data_structures::SortedCollection;
+use crate::guard::Guard;
 
 type NodePtr<T> = *mut SortedListNode<T>;
 
@@ -273,13 +274,17 @@ impl<T> ListNodePosition<T> {
     }
 }
 
-pub struct SortedList<T> {
+pub struct SortedList<T, G: Guard> {
     pub(crate) head: AtomicPtr<SortedListNode<T>>,
+    /// Shared guard instance for deferred destruction.
+    /// All deleted nodes are deferred to this guard and freed when it drops.
+    guard: G,
 }
 
-impl<T> SortedList<T>
+impl<T, G> SortedList<T, G>
 where
     T: Eq + Ord,
+    G: Guard,
 {
     pub fn new() -> Self {
         // Create sentinel head node without a value.
@@ -287,7 +292,14 @@ where
         let head_node = Box::into_raw(Box::new(SortedListNode::new_sentinel()));
         SortedList {
             head: AtomicPtr::new(head_node),
+            guard: G::default(),
         }
+    }
+
+    /// Get the shared guard instance for this collection.
+    /// Used by SortedCollection trait methods for deferred destruction.
+    pub fn guard(&self) -> &G {
+        &self.guard
     }
 
     /// Unlinks a marked node from the list, guaranteeing completion before return.
@@ -532,12 +544,18 @@ where
 
 /// Implement SortedCollection for SortedList.
 ///
-impl<T> SortedCollection<T> for SortedList<T>
+impl<T, G> SortedCollection<T> for SortedList<T, G>
 where
     T: Eq + Ord,
+    G: Guard,
 {
+    type Guard = G;
     type Node = SortedListNode<T>;
     type NodePosition = ListNodePosition<T>;
+
+    fn guard(&self) -> &G {
+        &self.guard
+    }
 
     /// Internal insert that optionally starts from a position.
     ///
@@ -903,16 +921,17 @@ where
     }
 }
 
-impl<T> Default for SortedList<T>
+impl<T, G> Default for SortedList<T, G>
 where
     T: Eq + Ord,
+    G: Guard,
 {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T> Drop for SortedList<T> {
+impl<T, G: Guard> Drop for SortedList<T, G> {
     fn drop(&mut self) {
         // Clean up all nodes including sentinel.
         //
@@ -949,8 +968,7 @@ impl<T> Drop for SortedList<T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::data_structures::DeferredCollection;
-    use crate::data_structures::SafeSortedCollection;
+    use crate::guard::DeferredGuard;
 
     use super::*;
     use std::sync::Arc;
@@ -958,7 +976,7 @@ mod tests {
 
     #[test]
     fn test_recovery_from_marked_start() {
-        let list = SortedList::new();
+        let list: SortedList<i32, DeferredGuard> = SortedList::new();
 
         // Insert nodes 0..100
         for i in 0..100 {
@@ -966,6 +984,7 @@ mod tests {
         }
 
         // Get a pointer to node 50
+        let _guard = DeferredGuard::pin();
         let node_50 = list.find_from_internal(None, &50, true).unwrap();
 
         // Mark node 50 for deletion - use remove_from_internal to get pointer for cleanup
@@ -992,7 +1011,7 @@ mod tests {
 
     #[test]
     fn test_marked_pointer_as_start_node() {
-        let list = SortedList::new();
+        let list: SortedList<i32, DeferredGuard> = SortedList::new();
 
         // Insert nodes
         for i in 0..100 {
@@ -1000,6 +1019,7 @@ mod tests {
         }
 
         // Get pointer to node 50
+        let _guard = DeferredGuard::pin();
         let node_50 = list.find_from_internal(None, &50, true).unwrap();
 
         // Mark node 50 for deletion - use remove_from_internal to get pointer for cleanup
@@ -1026,7 +1046,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_recovery() {
-        let list = Arc::new(DeferredCollection::new(SortedList::new()));
+        let list: Arc<SortedList<i32, DeferredGuard>> = Arc::new(SortedList::new());
 
         // Pre-populate with nodes
         for i in 0..1000 {
@@ -1067,7 +1087,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_delete_insert() {
-        let list = Arc::new(DeferredCollection::new(SortedList::new()));
+        let list: Arc<SortedList<i32, DeferredGuard>> = Arc::new(SortedList::new());
         let num_threads = 4;
         let operations_per_thread = 100;
 
@@ -1101,7 +1121,7 @@ mod tests {
 
     #[test]
     fn test_update_basic() {
-        let list = DeferredCollection::new(SortedList::new());
+        let list: SortedList<i32, DeferredGuard> = SortedList::new();
 
         // Insert initial values
         list.insert(10);
@@ -1121,7 +1141,7 @@ mod tests {
         assert!(list.contains(&20));
 
         // List should still contain all values
-        let values: Vec<_> = list.iter().map(|x| *x).collect();
+        let values = list.to_vec();
         assert_eq!(values.len(), 3);
         assert!(values.contains(&10));
         assert!(values.contains(&20));
@@ -1132,7 +1152,7 @@ mod tests {
 
     #[test]
     fn test_update_not_found() {
-        let list = DeferredCollection::new(SortedList::new());
+        let list: SortedList<i32, DeferredGuard> = SortedList::new();
 
         list.insert(10);
         list.insert(30);
@@ -1142,7 +1162,7 @@ mod tests {
         assert!(!result);
 
         // List unchanged
-        let values: Vec<_> = list.iter().map(|x| *x).collect();
+        let values = list.to_vec();
         assert_eq!(values.len(), 2);
 
         println!("Update not found test passed");
@@ -1150,9 +1170,7 @@ mod tests {
 
     #[test]
     fn test_update_preserves_order() {
-        use crate::data_structures::SafeSortedCollection;
-
-        let list = DeferredCollection::new(SortedList::new());
+        let list: SortedList<i32, DeferredGuard> = SortedList::new();
 
         // Insert in order
         for i in 0..10 {
@@ -1164,10 +1182,10 @@ mod tests {
         assert!(result);
 
         // Verify order preserved
-        let values: Vec<_> = list.iter().map(|x| *x).collect();
+        let values = list.to_vec();
         assert_eq!(values.len(), 10);
         for i in 0..10 {
-            assert_eq!(values[i], i);
+            assert_eq!(values[i], i as i32);
         }
 
         println!("Update preserves order test passed");
@@ -1175,7 +1193,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_updates() {
-        let list = Arc::new(DeferredCollection::new(SortedList::new()));
+        let list: Arc<SortedList<i32, DeferredGuard>> = Arc::new(SortedList::new());
         let num_elements = 100;
 
         // Insert initial elements
@@ -1215,7 +1233,7 @@ mod tests {
 
     #[test]
     fn test_update_with_concurrent_delete() {
-        let list = Arc::new(DeferredCollection::new(SortedList::new()));
+        let list: Arc<SortedList<i32, DeferredGuard>> = Arc::new(SortedList::new());
 
         // Insert elements
         for i in 0..100 {
@@ -1251,7 +1269,7 @@ mod tests {
 
     #[test]
     fn test_update_with_concurrent_insert() {
-        let list = Arc::new(DeferredCollection::new(SortedList::new()));
+        let list: Arc<SortedList<i32, DeferredGuard>> = Arc::new(SortedList::new());
 
         // Insert initial elements (even numbers)
         for i in (0..100).step_by(2) {

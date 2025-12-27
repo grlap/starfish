@@ -1,98 +1,91 @@
 use rstest::rstest;
 use serial_test::serial;
 use starfish_core::common_tests::sorted_collection_core_tests::*;
-use starfish_core::data_structures::{DeferredCollection, SkipList, SortedCollection, SortedList};
-use starfish_crossbeam::epoch_guarded_sorted_collection::EpochGuardedCollection;
+use starfish_core::data_structures::SkipList;
+use starfish_core::data_structures::SortedCollection;
+use starfish_core::data_structures::SortedList;
+use starfish_crossbeam::EpochGuard;
 
-// Trait for type-level parametrization
-trait TestSortedCollection {
-    type CollectionType: SortedCollection<i32> + Default + Send + Sync + 'static;
-}
-
-// Marker types for each collection
-struct UseSortedList;
-struct UseSkipList;
-
-impl TestSortedCollection for UseSortedList {
-    type CollectionType = SortedList<i32>;
-}
-
-impl TestSortedCollection for UseSkipList {
-    type CollectionType = SkipList<i32>;
-}
+// Type aliases for cleaner test code
+type EpochSortedList = SortedList<i32, EpochGuard>;
+type EpochSkipList = SkipList<i32, EpochGuard>;
 
 #[rstest]
 #[serial]
-#[case::sorted_list(UseSortedList)]
-#[case::skip_list(UseSkipList)]
-fn test_basic<T: TestSortedCollection>(#[case] _type: T) {
-    let collection = EpochGuardedCollection::<i32, T::CollectionType>::default();
+#[case::sorted_list(EpochSortedList::default())]
+#[case::skip_list(EpochSkipList::default())]
+fn test_basic<C: SortedCollection<i32>>(#[case] collection: C) {
     test_basic_operations(&collection);
 }
 
 #[rstest]
 #[serial]
-#[case::sorted_list(UseSortedList)]
-#[case::skip_list(UseSkipList)]
-fn test_concurrent<T: TestSortedCollection>(#[case] _type: T) {
-    test_concurrent_operations::<EpochGuardedCollection<i32, T::CollectionType>>();
+#[case::sorted_list(EpochSortedList::default())]
+#[case::skip_list(EpochSkipList::default())]
+fn test_concurrent<C: SortedCollection<i32> + Default + Send + Sync + 'static>(
+    #[case] _collection: C,
+) {
+    test_concurrent_operations::<C>();
 }
 
 #[rstest]
 #[serial]
-#[case::sorted_list(UseSortedList)]
-#[case::skip_list(UseSkipList)]
-fn test_concurrent_mixed<T: TestSortedCollection>(#[case] _type: T) {
-    test_concurrent_mixed_operations::<EpochGuardedCollection<i32, T::CollectionType>>();
+#[case::sorted_list(EpochSortedList::default())]
+#[case::skip_list(EpochSkipList::default())]
+fn test_concurrent_mixed<C: SortedCollection<i32> + Default + Send + Sync + 'static>(
+    #[case] _collection: C,
+) {
+    test_concurrent_mixed_operations::<C>();
 }
 
 #[rstest]
 #[serial]
-#[case::sorted_list(UseSortedList)]
-#[case::skip_list(UseSkipList)]
-fn test_find_apply<T: TestSortedCollection>(#[case] _type: T) {
-    let collection = EpochGuardedCollection::<i32, T::CollectionType>::default();
-    test_find_and_apply(&collection);
+#[case::sorted_list(EpochSortedList::default())]
+#[case::skip_list(EpochSkipList::default())]
+fn test_find_apply<C: SortedCollection<i32>>(#[case] collection: C) {
+    test_find_and_apply::<C>(&collection);
 }
 
 #[rstest]
 #[serial]
-#[case::sorted_list(UseSortedList)]
-#[case::skip_list(UseSkipList)]
-fn test_sequential<T: TestSortedCollection>(#[case] _type: T) {
-    test_sequential_operations::<EpochGuardedCollection<i32, T::CollectionType>>();
+#[case::sorted_list(EpochSortedList::default())]
+#[case::skip_list(EpochSkipList::default())]
+fn test_sequential<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
+    test_sequential_operations::<C>();
 }
 
 #[rstest]
 #[serial]
-#[case::sorted_list(UseSortedList)]
-#[case::skip_list(UseSkipList)]
-fn test_contention<T: TestSortedCollection>(#[case] _type: T) {
-    test_high_contention::<EpochGuardedCollection<i32, T::CollectionType>>();
+#[case::sorted_list(EpochSortedList::default())]
+#[case::skip_list(EpochSkipList::default())]
+fn test_contention<C: SortedCollection<i32> + Default + Send + Sync + 'static>(
+    #[case] _collection: C,
+) {
+    test_high_contention::<C>();
 }
 
 #[rstest]
 #[serial]
-#[case::sorted_list(UseSortedList)]
-#[case::skip_list(UseSkipList)]
-fn test_find_ref<T: TestSortedCollection>(#[case] _type: T) {
-    test_find::<EpochGuardedCollection<i32, T::CollectionType>>();
+#[case::sorted_list(EpochSortedList::default())]
+#[case::skip_list(EpochSkipList::default())]
+fn test_find_ref<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
+    test_find::<C>();
 }
 
 #[rstest]
 #[serial]
-#[case::sorted_list(UseSortedList)]
-#[case::skip_list(UseSkipList)]
-fn test_remove_value<T: TestSortedCollection>(#[case] _type: T) {
-    test_remove_returns_value::<EpochGuardedCollection<i32, T::CollectionType>>();
+#[case::sorted_list(EpochSortedList::default())]
+#[case::skip_list(EpochSkipList::default())]
+fn test_remove_value<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
+    test_remove_returns_value::<C>();
 }
 
 #[rstest]
 #[serial]
-#[case::sorted_list(UseSortedList)]
-#[case::skip_list(UseSkipList)]
-fn test_empty<T: TestSortedCollection>(#[case] _type: T) {
-    test_is_empty::<EpochGuardedCollection<i32, T::CollectionType>>();
+#[case::sorted_list(EpochSortedList::default())]
+#[case::skip_list(EpochSkipList::default())]
+fn test_empty<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
+    test_is_empty::<C>();
 }
 
 // ============================================================================
@@ -101,76 +94,75 @@ fn test_empty<T: TestSortedCollection>(#[case] _type: T) {
 
 #[rstest]
 #[serial]
-#[case::sorted_list(UseSortedList)]
-#[case::skip_list(UseSkipList)]
-fn test_batch_basic<T: TestSortedCollection>(#[case] _type: T) {
-    test_insert_batch_basic::<EpochGuardedCollection<i32, T::CollectionType>>();
+#[case::sorted_list(EpochSortedList::default())]
+#[case::skip_list(EpochSkipList::default())]
+fn test_batch_basic<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
+    test_insert_batch_basic::<C>();
 }
 
 #[rstest]
 #[serial]
-#[case::sorted_list(UseSortedList)]
-#[case::skip_list(UseSkipList)]
-fn test_batch_empty<T: TestSortedCollection>(#[case] _type: T) {
-    test_insert_batch_empty::<EpochGuardedCollection<i32, T::CollectionType>>();
+#[case::sorted_list(EpochSortedList::default())]
+#[case::skip_list(EpochSkipList::default())]
+fn test_batch_empty<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
+    test_insert_batch_empty::<C>();
 }
 
 #[rstest]
 #[serial]
-#[case::sorted_list(UseSortedList)]
-#[case::skip_list(UseSkipList)]
-fn test_batch_with_duplicates<T: TestSortedCollection>(#[case] _type: T) {
-    test_insert_batch_with_duplicates::<EpochGuardedCollection<i32, T::CollectionType>>();
+#[case::sorted_list(EpochSortedList::default())]
+#[case::skip_list(EpochSkipList::default())]
+fn test_batch_with_duplicates<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
+    test_insert_batch_with_duplicates::<C>();
 }
 
 #[rstest]
 #[serial]
-#[case::sorted_list(UseSortedList)]
-#[case::skip_list(UseSkipList)]
-fn test_batch_with_existing<T: TestSortedCollection>(#[case] _type: T) {
-    test_insert_batch_with_existing::<EpochGuardedCollection<i32, T::CollectionType>>();
+#[case::sorted_list(EpochSortedList::default())]
+#[case::skip_list(EpochSkipList::default())]
+fn test_batch_with_existing<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
+    test_insert_batch_with_existing::<C>();
 }
 
 #[rstest]
 #[serial]
-#[case::sorted_list(UseSortedList)]
-#[case::skip_list(UseSkipList)]
-fn test_batch_from_unsorted<T: TestSortedCollection>(#[case] _type: T) {
-    test_insert_batch_from_unsorted::<EpochGuardedCollection<i32, T::CollectionType>>();
+#[case::sorted_list(EpochSortedList::default())]
+#[case::skip_list(EpochSkipList::default())]
+fn test_batch_from_unsorted<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
+    test_insert_batch_from_unsorted::<C>();
 }
 
 #[rstest]
 #[serial]
-#[case::sorted_list(UseSortedList)]
-#[case::skip_list(UseSkipList)]
-fn test_batch_preserves_order<T: TestSortedCollection>(#[case] _type: T) {
-    test_insert_batch_preserves_order::<EpochGuardedCollection<i32, T::CollectionType>>();
+#[case::sorted_list(EpochSortedList::default())]
+#[case::skip_list(EpochSkipList::default())]
+fn test_batch_preserves_order<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
+    test_insert_batch_preserves_order::<C>();
 }
 
 #[rstest]
 #[serial]
-#[case::sorted_list(UseSortedList)]
-#[case::skip_list(UseSkipList)]
-fn test_batch_large<T: TestSortedCollection>(#[case] _type: T) {
-    test_insert_batch_large::<EpochGuardedCollection<i32, T::CollectionType>>();
+#[case::sorted_list(EpochSortedList::default())]
+#[case::skip_list(EpochSkipList::default())]
+fn test_batch_large<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
+    test_insert_batch_large::<C>();
 }
 
 // ============================================================================
-// Benchmark hang reproduction test
-// This test exactly matches bench_concurrent_update from the benchmark
+// Benchmark hang reproduction tests
 // ============================================================================
 
-use starfish_core::data_structures::SafeSortedCollection;
 use std::sync::Arc;
 use std::thread;
 
+type EpochSkipListI64 = SkipList<i64, EpochGuard>;
+
 /// Test that exactly matches the hanging benchmark pattern.
-/// Uses EpochGuardedCollection<i64, SkipList<i64>> - the exact type from the benchmark.
+/// Uses SkipList<i64, EpochGuard> - the exact type from the benchmark.
 #[test]
 #[serial]
 fn test_benchmark_hang_reproduction_skiplist() {
-    let list: Arc<EpochGuardedCollection<i64, SkipList<i64>>> =
-        Arc::new(EpochGuardedCollection::default());
+    let list: Arc<EpochSkipListI64> = Arc::new(SkipList::default());
 
     let thread_count = 16;
     let ops_per_thread = 100; // Match benchmark inner loop count
@@ -219,8 +211,7 @@ fn test_benchmark_hang_reproduction_skiplist() {
 #[test]
 #[serial]
 fn test_benchmark_high_contention_skiplist() {
-    let list: Arc<EpochGuardedCollection<i64, SkipList<i64>>> =
-        Arc::new(EpochGuardedCollection::default());
+    let list: Arc<EpochSkipListI64> = Arc::new(SkipList::default());
 
     let thread_count = 16;
     let ops_per_thread = 1000;
@@ -261,17 +252,10 @@ fn test_benchmark_high_contention_skiplist() {
 }
 
 /// Extended version that runs longer to increase probability of hitting the hang
-/// #TODO isolates the issue,
 #[test]
 #[serial]
 fn test_benchmark_extended_run_skiplist() {
-    //let list: Arc<EpochGuardedCollection<i64, SortedList<i64>>> =
-    //Arc::new(EpochGuardedCollection::default());
-
-    let list: Arc<EpochGuardedCollection<i64, SkipList<i64>>> =
-        Arc::new(EpochGuardedCollection::default());
-    //let list: Arc<DeferredCollection<i64, SkipList<i64>>> =
-    //        Arc::new(DeferredCollection::default());
+    let list: Arc<EpochSkipListI64> = Arc::new(SkipList::default());
 
     let thread_count = 24; // More threads
     let ops_per_thread = 10_000; // More operations
@@ -288,7 +272,7 @@ fn test_benchmark_extended_run_skiplist() {
         let list_clone = Arc::clone(&list);
         let handle = thread::spawn(move || {
             for i in 0..ops_per_thread {
-                for j in 0..key_range {
+                for _j in 0..key_range {
                     let key = (i as i64) % key_range;
                     list_clone.update(key);
                 }
@@ -314,8 +298,7 @@ fn test_benchmark_extended_run_skiplist() {
 fn test_update_with_epoch_pressure() {
     use crossbeam_epoch as epoch;
 
-    let list: Arc<EpochGuardedCollection<i64, SkipList<i64>>> =
-        Arc::new(EpochGuardedCollection::default());
+    let list: Arc<EpochSkipListI64> = Arc::new(SkipList::default());
 
     let thread_count = 16;
     let ops_per_thread = 1000;
@@ -359,9 +342,14 @@ fn test_update_with_epoch_pressure() {
 
 #[rstest]
 #[serial]
-#[case::skip_list(UseSkipList)]
-fn stress_concurrent_update_with_timeout<T: TestSortedCollection>(#[case] _type: T) {
+#[case::sorted_list(EpochSortedList::default())]
+#[case::skip_list(EpochSkipList::default())]
+fn stress_concurrent_update_with_timeout<
+    C: SortedCollection<i32> + Default + Send + Sync + 'static,
+>(
+    #[case] _collection: C,
+) {
     use starfish_core::common_tests::sorted_collection_stress_tests::test_concurrent_update_with_timeout;
 
-    test_concurrent_update_with_timeout::<EpochGuardedCollection<i32, T::CollectionType>>();
+    test_concurrent_update_with_timeout::<C>();
 }

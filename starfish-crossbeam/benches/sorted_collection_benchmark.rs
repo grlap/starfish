@@ -3,28 +3,39 @@
 //!
 //! Run with: cargo bench --package starfish-crossbeam --bench sorted_collection_benchmark
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::BenchmarkId;
+use criterion::Criterion;
+use criterion::black_box;
+use criterion::criterion_group;
+use criterion::criterion_main;
 use crossbeam_skiplist::SkipMap;
 use mimalloc::MiMalloc;
 use std::sync::Arc;
 use std::thread;
 
-use starfish_core::data_structures::{Ordered, SafeSortedCollection, SkipList, SortedList};
-use starfish_crossbeam::epoch_guarded_sorted_collection::EpochGuardedCollection;
+use starfish_core::data_structures::Ordered;
+use starfish_core::data_structures::SkipList;
+use starfish_core::data_structures::SortedCollection;
+use starfish_core::data_structures::SortedList;
+use starfish_crossbeam::EpochGuard;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
 const OPS_PER_THREAD: usize = 10_000;
 
+// Type aliases for convenience
+type EpochSkipList = SkipList<i64, EpochGuard>;
+type EpochSortedList = SortedList<i64, EpochGuard>;
+
 // ============================================================================
-// Generic benchmark helpers for SafeSortedCollection
+// Generic benchmark helpers for SortedCollection
 // ============================================================================
 
-/// Generic sequential update benchmark - works with any SafeSortedCollection
+/// Generic sequential update benchmark - works with any SortedCollection
 fn bench_update<C>(list: &C, count: usize, update_iterations: usize)
 where
-    C: SafeSortedCollection<i64>,
+    C: SortedCollection<i64>,
 {
     // Pre-populate
     for i in 0..count {
@@ -39,10 +50,10 @@ where
     }
 }
 
-/// Generic delete+insert benchmark - works with any SafeSortedCollection
+/// Generic delete+insert benchmark - works with any SortedCollection
 fn bench_delete_insert<C>(list: &C, count: usize, update_iterations: usize)
 where
-    C: SafeSortedCollection<i64>,
+    C: SortedCollection<i64>,
 {
     // Pre-populate
     for i in 0..count {
@@ -58,10 +69,10 @@ where
     }
 }
 
-/// Generic concurrent update benchmark - works with any SafeSortedCollection
+/// Generic concurrent update benchmark - works with any SortedCollection
 fn bench_concurrent_update<C>(list: Arc<C>, thread_count: usize, ops_per_thread: usize)
 where
-    C: SafeSortedCollection<i64> + Send + Sync + 'static,
+    C: SortedCollection<i64> + Send + Sync + 'static,
 {
     // Pre-populate with values that each thread will update
     let total_keys = thread_count * 100;
@@ -89,10 +100,10 @@ where
     }
 }
 
-/// Generic concurrent delete+insert benchmark - works with any SafeSortedCollection
+/// Generic concurrent delete+insert benchmark - works with any SortedCollection
 fn bench_concurrent_delete_insert<C>(list: Arc<C>, thread_count: usize, ops_per_thread: usize)
 where
-    C: SafeSortedCollection<i64> + Send + Sync + 'static,
+    C: SortedCollection<i64> + Send + Sync + 'static,
 {
     // Pre-populate with distinct key ranges for each thread
     let keys_per_thread = 100;
@@ -124,10 +135,10 @@ where
     }
 }
 
-/// Generic high contention update benchmark - works with any SafeSortedCollection
+/// Generic high contention update benchmark - works with any SortedCollection
 fn bench_high_contention<C>(list: Arc<C>, thread_count: usize, ops_per_thread: usize)
 where
-    C: SafeSortedCollection<i64> + Send + Sync + 'static,
+    C: SortedCollection<i64> + Send + Sync + 'static,
 {
     // Pre-populate with small key range
     let key_range = 50i64;
@@ -158,32 +169,7 @@ where
 // ============================================================================
 
 fn bench_starfish_skiplist_insert(thread_count: usize, ops_per_thread: usize) {
-    let list: Arc<EpochGuardedCollection<i64, SkipList<i64>>> =
-        Arc::new(EpochGuardedCollection::default());
-    let mut handles = vec![];
-
-    for t in 0..thread_count {
-        let list_clone = Arc::clone(&list);
-        let handle = thread::spawn(move || {
-            let base = (t * ops_per_thread) as i64;
-            for i in 0..ops_per_thread {
-                list_clone.insert(base + i as i64);
-            }
-        });
-        handles.push(handle);
-    }
-
-    for handle in handles {
-        handle.join().unwrap();
-    }
-}
-
-// NOTE: SkipList (without backlinks) functions are disabled due to concurrent bugs.
-// Keeping the code for reference but marked as dead_code.
-#[allow(dead_code)]
-fn bench_starfish_insert(thread_count: usize, ops_per_thread: usize) {
-    let list: Arc<EpochGuardedCollection<i64, SkipList<i64>>> =
-        Arc::new(EpochGuardedCollection::default());
+    let list: Arc<EpochSkipList> = Arc::new(EpochSkipList::default());
     let mut handles = vec![];
 
     for t in 0..thread_count {
@@ -227,42 +213,7 @@ fn bench_crossbeam_insert(thread_count: usize, ops_per_thread: usize) {
 // ============================================================================
 
 fn bench_starfish_skiplist_mixed(thread_count: usize, ops_per_thread: usize) {
-    let list: Arc<EpochGuardedCollection<i64, SkipList<i64>>> =
-        Arc::new(EpochGuardedCollection::default());
-
-    // Pre-populate with half the values
-    for i in 0..(thread_count * ops_per_thread / 2) {
-        list.insert(i as i64);
-    }
-
-    let mut handles = vec![];
-
-    for t in 0..thread_count {
-        let list_clone = Arc::clone(&list);
-        let handle = thread::spawn(move || {
-            let base = (t * ops_per_thread) as i64;
-            for i in 0..ops_per_thread {
-                if i % 2 == 0 {
-                    // Insert new value
-                    list_clone.insert(base + i as i64 + 1_000_000);
-                } else {
-                    // Delete existing value
-                    list_clone.delete(&(i as i64 / 2));
-                }
-            }
-        });
-        handles.push(handle);
-    }
-
-    for handle in handles {
-        handle.join().unwrap();
-    }
-}
-
-#[allow(dead_code)]
-fn bench_starfish_mixed(thread_count: usize, ops_per_thread: usize) {
-    let list: Arc<EpochGuardedCollection<i64, SkipList<i64>>> =
-        Arc::new(EpochGuardedCollection::default());
+    let list: Arc<EpochSkipList> = Arc::new(EpochSkipList::default());
 
     // Pre-populate with half the values
     for i in 0..(thread_count * ops_per_thread / 2) {
@@ -330,37 +281,7 @@ fn bench_crossbeam_mixed(thread_count: usize, ops_per_thread: usize) {
 // ============================================================================
 
 fn bench_starfish_skiplist_contention(thread_count: usize, ops_per_thread: usize) {
-    let list: Arc<EpochGuardedCollection<i64, SkipList<i64>>> =
-        Arc::new(EpochGuardedCollection::default());
-    let mut handles = vec![];
-
-    // Small key range to maximize contention
-    let key_range = 100i64;
-
-    for _ in 0..thread_count {
-        let list_clone = Arc::clone(&list);
-        let handle = thread::spawn(move || {
-            for i in 0..ops_per_thread {
-                let key = (i as i64) % key_range;
-                if i % 2 == 0 {
-                    list_clone.insert(key);
-                } else {
-                    list_clone.delete(&key);
-                }
-            }
-        });
-        handles.push(handle);
-    }
-
-    for handle in handles {
-        handle.join().unwrap();
-    }
-}
-
-#[allow(dead_code)]
-fn bench_starfish_contention(thread_count: usize, ops_per_thread: usize) {
-    let list: Arc<EpochGuardedCollection<i64, SkipList<i64>>> =
-        Arc::new(EpochGuardedCollection::default());
+    let list: Arc<EpochSkipList> = Arc::new(EpochSkipList::default());
     let mut handles = vec![];
 
     // Small key range to maximize contention
@@ -431,16 +352,6 @@ fn insert_benchmark(c: &mut Criterion) {
             },
         );
 
-        // NOTE: Old SkipList (without backlinks) was removed - now there's only one SkipList implementation.
-        // See README.md "Known Issues" section. Use SkipList instead.
-        // group.bench_with_input(
-        //     BenchmarkId::new("insert_benchmark_skiplist", threads),
-        //     &threads,
-        //     |b, &threads| {
-        //         b.iter(|| bench_starfish_insert(black_box(threads), black_box(OPS_PER_THREAD)))
-        //     },
-        // );
-
         group.bench_with_input(
             BenchmarkId::new("insert_benchmark_crossbeam", threads),
             &threads,
@@ -466,15 +377,6 @@ fn mixed_benchmark(c: &mut Criterion) {
                 })
             },
         );
-
-        // NOTE: Old SkipList (without backlinks) was removed - now there's only one SkipList implementation.
-        // group.bench_with_input(
-        //     BenchmarkId::new("mixed_benchmark_skiplist", threads),
-        //     &threads,
-        //     |b, &threads| {
-        //         b.iter(|| bench_starfish_mixed(black_box(threads), black_box(OPS_PER_THREAD)))
-        //     },
-        // );
 
         group.bench_with_input(
             BenchmarkId::new("mixed_benchmark_crossbeam", threads),
@@ -505,15 +407,6 @@ fn contention_benchmark(c: &mut Criterion) {
             },
         );
 
-        // NOTE: Old SkipList (without backlinks) was removed - now there's only one SkipList implementation.
-        // group.bench_with_input(
-        //     BenchmarkId::new("contention_benchmark_skiplist", threads),
-        //     &threads,
-        //     |b, &threads| {
-        //         b.iter(|| bench_starfish_contention(black_box(threads), black_box(OPS_PER_THREAD)))
-        //     },
-        // );
-
         group.bench_with_input(
             BenchmarkId::new("contention_benchmark_crossbeam", threads),
             &threads,
@@ -532,7 +425,7 @@ fn contention_benchmark(c: &mut Criterion) {
 
 /// Sequential insert - one at a time
 fn bench_sequential_insert_skiplist(count: usize) {
-    let list: EpochGuardedCollection<i64, SkipList<i64>> = EpochGuardedCollection::default();
+    let list: EpochSkipList = EpochSkipList::default();
     for i in 0..count {
         list.insert(i as i64);
     }
@@ -547,14 +440,14 @@ fn bench_sequential_insert_crossbeam(count: usize) {
 
 /// Batch insert - using insert_batch with Ordered iterator
 fn bench_batch_insert_skiplist(count: usize) {
-    let list: EpochGuardedCollection<i64, SkipList<i64>> = EpochGuardedCollection::default();
+    let list: EpochSkipList = EpochSkipList::default();
     let data: Vec<i64> = (0..count as i64).collect();
     let ordered = Ordered::new(data.into_iter());
     list.insert_batch(ordered);
 }
 
 fn bench_batch_insert_sorted_list(count: usize) {
-    let list: EpochGuardedCollection<i64, SortedList<i64>> = EpochGuardedCollection::default();
+    let list: EpochSortedList = EpochSortedList::default();
     let data: Vec<i64> = (0..count as i64).collect();
     let ordered = Ordered::new(data.into_iter());
     list.insert_batch(ordered);
@@ -572,13 +465,6 @@ fn batch_insert_benchmark(c: &mut Criterion) {
             |b, &size| b.iter(|| bench_sequential_insert_skiplist(black_box(size))),
         );
 
-        // NOTE: Old SkipList (without backlinks) was removed - now there's only one SkipList implementation.
-        // group.bench_with_input(
-        //     BenchmarkId::new("batch_insert_benchmark_skiplist_sequential", size),
-        //     &size,
-        //     |b, &size| b.iter(|| bench_sequential_insert_skiplist(black_box(size))),
-        // );
-
         group.bench_with_input(
             BenchmarkId::new("batch_insert_benchmark_crossbeam_sequential", size),
             &size,
@@ -591,13 +477,6 @@ fn batch_insert_benchmark(c: &mut Criterion) {
             &size,
             |b, &size| b.iter(|| bench_batch_insert_skiplist(black_box(size))),
         );
-
-        // NOTE: Old SkipList (without backlinks) was removed - now there's only one SkipList implementation.
-        // group.bench_with_input(
-        //     BenchmarkId::new("batch_insert_benchmark_skiplist_batch", size),
-        //     &size,
-        //     |b, &size| b.iter(|| bench_batch_insert_skiplist(black_box(size))),
-        // );
 
         group.bench_with_input(
             BenchmarkId::new("batch_insert_benchmark_sorted_list_batch", size),
@@ -615,34 +494,19 @@ fn skiplist_batch_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("skiplist_batch_large_benchmark_sorted_collection");
 
     for size in [10_000, 50_000, 100_000, 200_000] {
-        // SkipList with backlinks - sequential
+        // SkipList - sequential
         group.bench_with_input(
             BenchmarkId::new("skiplist_batch_large_benchmark_skiplist_sequential", size),
             &size,
             |b, &size| b.iter(|| bench_sequential_insert_skiplist(black_box(size))),
         );
 
-        // SkipList with backlinks - batch
+        // SkipList - batch
         group.bench_with_input(
             BenchmarkId::new("skiplist_batch_large_benchmark_skiplist_batch", size),
             &size,
             |b, &size| b.iter(|| bench_batch_insert_skiplist(black_box(size))),
         );
-
-        // NOTE: Old SkipList (without backlinks) was removed - now there's only one SkipList implementation.
-        // // SkipList without backlinks - sequential
-        // group.bench_with_input(
-        //     BenchmarkId::new("skiplist_batch_large_benchmark_skiplist_sequential", size),
-        //     &size,
-        //     |b, &size| b.iter(|| bench_sequential_insert_skiplist(black_box(size))),
-        // );
-
-        // // SkipList without backlinks - batch
-        // group.bench_with_input(
-        //     BenchmarkId::new("skiplist_batch_large_benchmark_skiplist_batch", size),
-        //     &size,
-        //     |b, &size| b.iter(|| bench_batch_insert_skiplist(black_box(size))),
-        // );
 
         // Crossbeam for comparison (sequential only)
         group.bench_with_input(
@@ -661,7 +525,7 @@ fn skiplist_batch_benchmark(c: &mut Criterion) {
 
 fn bench_concurrent_sequential_insert<C>(thread_count: usize, ops_per_thread: usize)
 where
-    C: SafeSortedCollection<i64> + Default + Send + Sync + 'static,
+    C: SortedCollection<i64> + Default + Send + Sync + 'static,
 {
     let list: Arc<C> = Arc::new(C::default());
     let mut handles = vec![];
@@ -684,7 +548,7 @@ where
 
 fn bench_concurrent_batch_insert<C>(thread_count: usize, ops_per_thread: usize)
 where
-    C: SafeSortedCollection<i64> + Default + Send + Sync + 'static,
+    C: SortedCollection<i64> + Default + Send + Sync + 'static,
 {
     let list: Arc<C> = Arc::new(C::default());
     let mut handles = vec![];
@@ -710,7 +574,7 @@ fn concurrent_batch_benchmark(c: &mut Criterion) {
     let ops_per_thread = 5_000;
 
     for threads in [1, 2, 4, 8] {
-        // SkipList with backlinks
+        // SkipList
         group.bench_with_input(
             BenchmarkId::new(
                 "concurrent_batch_insert_benchmark_skiplist_sequential",
@@ -719,9 +583,10 @@ fn concurrent_batch_benchmark(c: &mut Criterion) {
             &threads,
             |b, &threads| {
                 b.iter(|| {
-                    bench_concurrent_sequential_insert::<
-                        EpochGuardedCollection<i64, SkipList<i64>>,
-                    >(black_box(threads), black_box(ops_per_thread))
+                    bench_concurrent_sequential_insert::<EpochSkipList>(
+                        black_box(threads),
+                        black_box(ops_per_thread),
+                    )
                 })
             },
         );
@@ -731,7 +596,7 @@ fn concurrent_batch_benchmark(c: &mut Criterion) {
             &threads,
             |b, &threads| {
                 b.iter(|| {
-                    bench_concurrent_batch_insert::<EpochGuardedCollection<i64, SkipList<i64>>>(
+                    bench_concurrent_batch_insert::<EpochSkipList>(
                         black_box(threads),
                         black_box(ops_per_thread),
                     )
@@ -747,7 +612,7 @@ fn concurrent_batch_benchmark(c: &mut Criterion) {
             &threads,
             |b, &threads| {
                 b.iter(|| {
-                    bench_concurrent_batch_insert::<EpochGuardedCollection<i64, SortedList<i64>>>(
+                    bench_concurrent_batch_insert::<EpochSortedList>(
                         black_box(threads),
                         black_box(ops_per_thread),
                     )
@@ -765,34 +630,31 @@ fn concurrent_batch_benchmark(c: &mut Criterion) {
 
 /// Sequential update benchmark - updates existing keys
 fn bench_sorted_list_update(count: usize, update_iterations: usize) {
-    let list: EpochGuardedCollection<i64, SortedList<i64>> = EpochGuardedCollection::default();
+    let list: EpochSortedList = EpochSortedList::default();
     bench_update(&list, count, update_iterations);
 }
 
 /// Delete+Insert for comparison (traditional approach to update)
 fn bench_sorted_list_delete_insert(count: usize, update_iterations: usize) {
-    let list: EpochGuardedCollection<i64, SortedList<i64>> = EpochGuardedCollection::default();
+    let list: EpochSortedList = EpochSortedList::default();
     bench_delete_insert(&list, count, update_iterations);
 }
 
 /// Concurrent update benchmark
 fn bench_concurrent_update_sorted_list(thread_count: usize, ops_per_thread: usize) {
-    let list: Arc<EpochGuardedCollection<i64, SortedList<i64>>> =
-        Arc::new(EpochGuardedCollection::default());
+    let list: Arc<EpochSortedList> = Arc::new(EpochSortedList::default());
     bench_concurrent_update(list, thread_count, ops_per_thread);
 }
 
 /// Concurrent delete+insert benchmark for comparison
 fn bench_concurrent_delete_insert_sorted_list(thread_count: usize, ops_per_thread: usize) {
-    let list: Arc<EpochGuardedCollection<i64, SortedList<i64>>> =
-        Arc::new(EpochGuardedCollection::default());
+    let list: Arc<EpochSortedList> = Arc::new(EpochSortedList::default());
     bench_concurrent_delete_insert(list, thread_count, ops_per_thread);
 }
 
 /// High contention update - all threads update same keys
 fn bench_high_contention_update(thread_count: usize, ops_per_thread: usize) {
-    let list: Arc<EpochGuardedCollection<i64, SortedList<i64>>> =
-        Arc::new(EpochGuardedCollection::default());
+    let list: Arc<EpochSortedList> = Arc::new(EpochSortedList::default());
     bench_high_contention(list, thread_count, ops_per_thread);
 }
 
@@ -825,7 +687,7 @@ fn concurrent_update_benchmark(c: &mut Criterion) {
 
     for threads in [1, 2, 4, 8] {
         group.bench_with_input(
-            BenchmarkId::new("concurrent_update_benchmark_update", threads),
+            BenchmarkId::new("concurrent_update_benchmark_sorted_list", threads),
             &threads,
             |b, &threads| {
                 b.iter(|| {
@@ -864,7 +726,7 @@ fn contention_update_benchmark(c: &mut Criterion) {
 
     for threads in [2, 4, 8, 12, 16] {
         group.bench_with_input(
-            BenchmarkId::new("contention_update_benchmark_high_contention", threads),
+            BenchmarkId::new("contention_update_benchmark_sorted_list", threads),
             &threads,
             |b, &threads| {
                 b.iter(|| {
@@ -883,27 +745,25 @@ fn contention_update_benchmark(c: &mut Criterion) {
 
 /// Sequential update benchmark for SkipList
 fn bench_skiplist_update(count: usize, update_iterations: usize) {
-    let list: EpochGuardedCollection<i64, SkipList<i64>> = EpochGuardedCollection::default();
+    let list: EpochSkipList = EpochSkipList::default();
     bench_update(&list, count, update_iterations);
 }
 
 /// Delete+Insert for SkipList (traditional approach)
 fn bench_skiplist_delete_insert(count: usize, update_iterations: usize) {
-    let list: EpochGuardedCollection<i64, SkipList<i64>> = EpochGuardedCollection::default();
+    let list: EpochSkipList = EpochSkipList::default();
     bench_delete_insert(&list, count, update_iterations);
 }
 
 /// Concurrent update benchmark for SkipList
 fn bench_concurrent_update_skiplist(thread_count: usize, ops_per_thread: usize) {
-    let list: Arc<EpochGuardedCollection<i64, SkipList<i64>>> =
-        Arc::new(EpochGuardedCollection::default());
+    let list: Arc<EpochSkipList> = Arc::new(EpochSkipList::default());
     bench_concurrent_update(list, thread_count, ops_per_thread);
 }
 
 /// High contention update for SkipList
 fn bench_high_contention_update_skiplist(thread_count: usize, ops_per_thread: usize) {
-    let list: Arc<EpochGuardedCollection<i64, SkipList<i64>>> =
-        Arc::new(EpochGuardedCollection::default());
+    let list: Arc<EpochSkipList> = Arc::new(EpochSkipList::default());
     bench_high_contention(list, thread_count, ops_per_thread);
 }
 
@@ -985,6 +845,6 @@ criterion_group!(
     contention_update_benchmark,
     skiplist_update_benchmark,
     concurrent_skiplist_update_benchmark,
-    contention_skiplist_update_benchmark
+    contention_skiplist_update_benchmark,
 );
 criterion_main!(benches);

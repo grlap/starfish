@@ -1,4 +1,4 @@
-//! Common stress tests for SafeSortedCollection implementations.
+//! Common stress tests for SortedCollection implementations.
 //!
 //! These tests verify concurrent correctness under high contention.
 
@@ -7,12 +7,12 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::data_structures::SafeSortedCollection;
+use crate::data_structures::SortedCollection;
 
 /// Test concurrent find operations during modifications
 pub fn test_find_during_modifications<C>()
 where
-    C: SafeSortedCollection<i32> + Default + Send + Sync + 'static,
+    C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -80,7 +80,7 @@ where
 /// Test memory ordering between producer and consumer
 pub fn test_memory_ordering<C>()
 where
-    C: SafeSortedCollection<i32> + Default + Send + Sync + 'static,
+    C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
     let data = Arc::new(AtomicUsize::new(0));
@@ -115,7 +115,7 @@ where
 /// Test concurrent delete of the same value - exactly one should succeed
 pub fn test_concurrent_delete_same_value<C>()
 where
-    C: SafeSortedCollection<i32> + Default + Send + Sync + 'static,
+    C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
     let num_threads = 100;
@@ -155,7 +155,7 @@ where
 /// Test linearizability - operations appear to take effect atomically
 pub fn test_linearizability<C>()
 where
-    C: SafeSortedCollection<i32> + Default + Send + Sync + 'static,
+    C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
     let num_threads = thread::available_parallelism()
@@ -201,7 +201,7 @@ where
 /// Test lock-freedom: at least one thread always makes progress
 pub fn test_progress_guarantee<C>()
 where
-    C: SafeSortedCollection<i32> + Default + Send + Sync + 'static,
+    C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
     let num_threads = thread::available_parallelism()
@@ -274,7 +274,7 @@ where
 /// Test extreme contention on a single key
 pub fn test_extreme_contention_single_key<C>()
 where
-    C: SafeSortedCollection<i32> + Default + Send + Sync + 'static,
+    C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
     let num_threads = 100;
@@ -327,7 +327,7 @@ where
 /// Test concurrent find and modify on overlapping ranges
 pub fn test_concurrent_find_and_modify<C>()
 where
-    C: SafeSortedCollection<i32> + Default + Send + Sync + 'static,
+    C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
     let num_threads = 32;
@@ -381,7 +381,7 @@ where
 /// Test high contention with many threads doing mixed operations
 pub fn test_high_contention_mixed<C>()
 where
-    C: SafeSortedCollection<i32> + Default + Send + Sync + 'static,
+    C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
     let num_threads = 64;
@@ -442,7 +442,7 @@ where
 /// Test ABA problem - rapid insert/delete/reinsert of same values
 pub fn test_aba_problem<C>()
 where
-    C: SafeSortedCollection<i32> + Default + Send + Sync + 'static,
+    C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
     let num_threads = 32;
@@ -483,7 +483,7 @@ where
 /// Each thread has its own key, but all threads try to update all keys
 pub fn test_extreme_contention_update_single_key<C>()
 where
-    C: SafeSortedCollection<i32> + Default + Send + Sync + 'static,
+    C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
     let num_threads = 16;
@@ -548,7 +548,7 @@ where
 /// This is the most extreme contention scenario - all threads compete for exactly one key
 pub fn test_focused_single_key_update<C>()
 where
-    C: SafeSortedCollection<i32> + Default + Send + Sync + 'static,
+    C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
     let num_threads = 16;
@@ -633,7 +633,7 @@ where
 /// causes contention at higher skip list levels where node towers overlap.
 pub fn test_concurrent_update_benchmark_pattern<C>()
 where
-    C: SafeSortedCollection<i64> + Default + Send + Sync + 'static,
+    C: SortedCollection<i64> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
     let thread_count = 16; // Match benchmark
@@ -697,7 +697,7 @@ where
 /// update the same small key range (50 keys)
 pub fn test_concurrent_update_high_contention<C>()
 where
-    C: SafeSortedCollection<i64> + Default + Send + Sync + 'static,
+    C: SortedCollection<i64> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
     let thread_count = 16;
@@ -755,7 +755,7 @@ where
 /// Uses a timeout to detect hangs
 pub fn test_concurrent_update_with_timeout<C>()
 where
-    C: SafeSortedCollection<i32> + Default + Send + Sync + 'static,
+    C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let ops_per_thread = 1_00;
     let thread_count = 1;
