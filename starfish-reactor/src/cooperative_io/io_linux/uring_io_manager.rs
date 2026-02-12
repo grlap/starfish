@@ -20,9 +20,11 @@ pub(crate) struct UringIOManager {
 /// [`UringIOManager`].
 /// See [`IOManager`].
 ///
+const DEFAULT_QUEUE_SIZE: u32 = 1024;
+
 impl UringIOManager {
-    pub(crate) fn try_new() -> io::Result<Self> {
-        let io_uring = IoUring::new(1024)?;
+    pub(crate) fn try_new(queue_size: u32) -> io::Result<Self> {
+        let io_uring = IoUring::new(queue_size)?;
 
         Ok(UringIOManager {
             io_uring,
@@ -106,9 +108,9 @@ impl IOManager for UringIOManager {
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or(Duration::from_secs(0));
 
-                let ts = types::Timespec::new();
-                ts.sec(duration.as_secs());
-                ts.nsec(duration.subsec_nanos());
+                let ts = types::Timespec::new()
+                    .sec(duration.as_secs())
+                    .nsec(duration.subsec_nanos());
 
                 let timeout_op = opcode::Timeout::new(&ts).build();
 
@@ -161,13 +163,23 @@ impl IOManager for UringIOManager {
     }
 }
 
-// Implements IOManager create options.
-//
-pub struct UringIOManagerCreateOptions {}
+/// Configuration options for creating a [`UringIOManager`].
+pub struct UringIOManagerCreateOptions {
+    queue_size: u32,
+}
 
 impl UringIOManagerCreateOptions {
     pub fn new() -> Self {
-        UringIOManagerCreateOptions {}
+        UringIOManagerCreateOptions {
+            queue_size: DEFAULT_QUEUE_SIZE,
+        }
+    }
+
+    /// Sets the io_uring submission/completion queue size.
+    /// Must be a power of 2. Default is 1024.
+    pub fn with_queue_size(mut self, queue_size: u32) -> Self {
+        self.queue_size = queue_size;
+        self
     }
 }
 
@@ -180,7 +192,7 @@ impl Default for UringIOManagerCreateOptions {
 impl IOManagerCreateOptions for UringIOManagerCreateOptions {
     fn try_new_io_manager(&self) -> io::Result<IOManagerHolder> {
         Ok(IOManagerHolder {
-            io_manager: Box::new(UringIOManager::try_new()?),
+            io_manager: Box::new(UringIOManager::try_new(self.queue_size)?),
         })
     }
 }

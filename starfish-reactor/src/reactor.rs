@@ -12,7 +12,6 @@ use std::{io, ptr};
 use binary_heap_plus::{BinaryHeap, MinComparator};
 use crossbeam::queue::SegQueue;
 
-use crate::cooperative_io::DefaultIOManager;
 use crate::cooperative_io::io_manager::{IOManager, IOManagerCreateOptions, IOManagerHolder};
 use crate::cooperative_io::io_wait_future::IOWaitFuture;
 use crate::cooperative_synchronization::event_future::{CooperativeEventFuture, EventFuture};
@@ -172,9 +171,9 @@ impl Reactor {
     }
 
     pub fn try_new() -> io::Result<Self> {
-        Ok(Self::with_io_manager(IOManagerHolder {
-            io_manager: Box::new(DefaultIOManager::try_new()?),
-        }))
+        Ok(Self::with_io_manager(
+            crate::cooperative_io::DefaultIOManagerCreateOptions::default().try_new_io_manager()?,
+        ))
     }
 
     pub fn try_new_with_io_manager<T: IOManagerCreateOptions + Send + Sync + 'static>(

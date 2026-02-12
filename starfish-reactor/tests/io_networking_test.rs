@@ -24,7 +24,7 @@ async fn http_perform_get_request(url: String) -> Result<String, Box<dyn error::
     let request_str =
         "GET / HTTP/1.1\r\nHost: www.wp.pl\r\nUser-Agent: curl\r\nAccept: */*\r\n\r\n";
 
-    let written_bytes = tcp_stream
+    let _written_bytes = tcp_stream
         .write(request_str.as_bytes().to_vec().as_mut_slice())
         .await?;
 
@@ -119,7 +119,7 @@ fn udp_net_server(udp_server_socket: net::UdpSocket) {
     std::thread::sleep(time::Duration::from_secs(5));
 
     udp_server_socket
-        .send_to(&mut buffer[..512], socket_addr)
+        .send_to(&buffer[..512], socket_addr)
         .unwrap();
 }
 
@@ -128,10 +128,10 @@ async fn udp_cooperative_client(
     send_timeout: Option<IOTimeout>,
     recv_timeout: Option<IOTimeout>,
 ) -> Result<bool, Box<dyn error::Error>> {
-    let source_address = "0.0.0.0:0".to_socket_addrs()?.next().ok_or(io::Error::new(
-        io::ErrorKind::Other,
-        "failed to resolve address",
-    ))?;
+    let source_address = "0.0.0.0:0"
+        .to_socket_addrs()?
+        .next()
+        .ok_or(io::Error::other("failed to resolve address"))?;
 
     let mut udp_client_socket = UdpSocket::bind(source_address).await?;
 
@@ -140,10 +140,7 @@ async fn udp_cooperative_client(
     let destination_address = format!("127.0.0.1:{}", udp_server_port)
         .to_socket_addrs()?
         .next()
-        .ok_or(io::Error::new(
-            io::ErrorKind::Other,
-            "failed to resolve address",
-        ))?;
+        .ok_or(io::Error::other("failed to resolve address"))?;
 
     let send_bytes = udp_client_socket
         .send_to_with_timeout(destination_address, &mut buffer, &send_timeout)

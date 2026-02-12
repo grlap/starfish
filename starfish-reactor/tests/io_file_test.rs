@@ -18,10 +18,7 @@ async fn read_file_async(file_path: String) {
 
     let buffer_len: usize = 10 * 1024 * 1024;
 
-    let mut buffer: Vec<u8> = Vec::with_capacity(buffer_len);
-    unsafe {
-        buffer.set_len(buffer_len);
-    }
+    let mut buffer: Vec<u8> = vec![0; buffer_len];
 
     println!("[] => load");
     let read_count = file.read(&mut buffer).await.expect("read failed");
@@ -44,8 +41,8 @@ async fn read_files_async(file_path: String) -> bool {
             .open(file_path.clone())
             .expect("failed to create a file");
 
-        let mut buffer: Vec<u8> = vec![1; 1 * 1024 * 1024 * 1024];
-        let written = file.write(&mut buffer).await.expect("write failed");
+        let buffer: Vec<u8> = vec![1; 1024 * 1024 * 1024];
+        let written = file.write(&buffer).await.expect("write failed");
 
         assert_eq!(written, buffer.len());
     }
@@ -75,7 +72,7 @@ fn test_file_read() {
 
     reactor.run();
 
-    assert_eq!(true, result_future.unwrap_result());
+    assert!(result_future.unwrap_result());
 }
 
 #[cfg(target_os = "windows")]
@@ -90,5 +87,5 @@ fn test_file_read_with_pooling_port_io_manager() {
 
     reactor.run();
 
-    assert_eq!(true, result_future.unwrap_result());
+    assert!(result_future.unwrap_result());
 }

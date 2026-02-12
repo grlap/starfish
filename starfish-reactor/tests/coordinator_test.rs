@@ -117,6 +117,7 @@ fn test_spawn_external() {
     assert_eq!(1, result);
 }
 
+#[allow(clippy::manual_async_fn)]
 fn fibonacci_spawn_external(n: u64) -> impl Future<Output = u64> + Send {
     async move {
         match n {
@@ -261,12 +262,14 @@ fn test_spawn_external_chain_stress() {
         let completed = completed.clone();
         let done_event = done_event.clone();
 
-        let _ = Coordinator::reactor(start_reactor).spawn_external(chain_step(
-            start_reactor,
-            chain_depth,
-            completed,
-            done_event,
-        ));
+        drop(
+            Coordinator::reactor(start_reactor).spawn_external(chain_step(
+                start_reactor,
+                chain_depth,
+                completed,
+                done_event,
+            )),
+        );
     }
 
     // Wait for all chains to complete before shutdown.

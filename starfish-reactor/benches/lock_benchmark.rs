@@ -508,6 +508,25 @@ fn baseline_benchmark(c: &mut Criterion) {
         })
     });
 
+    // std::sync::Mutex: Inside async reactor context (fair comparison with cooperative locks).
+    group.bench_function("std_mutex_in_reactor_no_contention_1000", |b| {
+        b.iter(|| {
+            let mut reactor = Reactor::new();
+            let mutex = Arc::new(Mutex::new(0usize));
+
+            let mutex_clone = mutex.clone();
+            _ = reactor.spawn(async move {
+                for _ in 0..1000 {
+                    let mut guard = mutex_clone.lock().unwrap();
+                    *guard += 1;
+                }
+            });
+
+            reactor.run();
+            black_box(*mutex.lock().unwrap())
+        })
+    });
+
     // std::sync::Mutex: Multi-threaded contention.
     group.bench_function("std_mutex_4_threads_contention_10000", |b| {
         use std::thread;
@@ -537,24 +556,6 @@ fn baseline_benchmark(c: &mut Criterion) {
             black_box(*mutex.lock().unwrap())
         })
     });
-
-    // parking_lot::Mutex comparison (if available).
-    #[cfg(feature = "parking_lot")]
-    {
-        use parking_lot::Mutex as ParkingLotMutex;
-
-        group.bench_function("parking_lot_mutex_no_contention_10000", |b| {
-            let mutex = ParkingLotMutex::new(0usize);
-
-            b.iter(|| {
-                for _ in 0..10000 {
-                    let mut guard = mutex.lock();
-                    *guard += 1;
-                }
-                black_box(*mutex.lock())
-            })
-        });
-    }
 
     group.finish();
 }
