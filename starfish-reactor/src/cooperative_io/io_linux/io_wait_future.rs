@@ -1,3 +1,8 @@
+//! Future type for awaiting io_uring operation completion.
+//!
+//! Provides `IOWaitFuture`, which holds an io_uring submission queue entry and yields
+//! to the reactor until the kernel completes the associated I/O operation.
+
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -24,7 +29,7 @@ impl IOWaitFuture {
             queue_entry: Some(queue_entry),
             future_runtime: None,
             io_result: None,
-            timeout: *timeout,
+            timeout: timeout.map(IOTimeout::normalize),
         }
     }
 
@@ -50,6 +55,13 @@ impl IOWaitFuture {
 
     pub(crate) fn set_timeout(&mut self, timeout: Option<IOTimeout>) {
         self.timeout = timeout;
+    }
+
+    /// Takes the stored completion result without polling (unit tests drive
+    /// the manager directly, outside a reactor).
+    #[cfg(test)]
+    pub(crate) fn take_io_result_for_test(&mut self) -> io::Result<usize> {
+        self.io_result.take().expect("io_result not set")
     }
 }
 

@@ -1,8 +1,22 @@
 [package]
 name = "starfish-http"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+brotli = "7.0.0"
+flate2 = "1.1.2"
 http = "1.3.1"
+bytes = "1"
+qpack = { version = "0.1.0", default-features = false }
+rustls = "0.23.31"
+starfish-quic = { version = "0.1.0", path = "../starfish-quic" }
+starfish-reactor = { version = "0.1.0", path = "../starfish-reactor" }
+starfish-tls = { version = "0.1.0", path = "../starfish-tls" }
+webpki-roots = "0.26.8"
+zstd = "0.13.3"
+
+[dev-dependencies]
+rcgen = "0.13.2"
+rustls-pemfile = "2.2.0"
 starfish-core = { version = "0.1.0", path = "../starfish-core" }

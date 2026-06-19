@@ -1,3 +1,8 @@
+//! Treap: a randomized binary search tree combining BST and heap properties.
+//!
+//! Provides a sequential (non-lock-free) key-value map ordered by keys,
+//! with expected O(log n) operations via random priorities.
+
 use std::cmp::Ordering;
 
 /// Node structure for the Treap.
@@ -169,81 +174,23 @@ impl<K: Ord + Clone, V, P: Ord + Clone> Treap<K, V, P> {
                             return node_box.left;
                         }
 
-                        // Case 3: Two children - find a replacement node based on priority
+                        // Case 3: Two children - rotate the node down until it
+                        // becomes a leaf or single-child, then remove it.
+                        // This maintains the min-heap invariant on priorities.
                         if node_box.left.as_ref().unwrap().priority
                             < node_box.right.as_ref().unwrap().priority
                         {
-                            // Left child has higher priority, it becomes the new root
-                            // Take ownership of the children to manipulate them
-                            let mut left_child = node_box.left.take().unwrap();
-                            let old_right = node_box.right.take();
-
-                            // Store the result value before dropping node_box
-                            *result = Some(node_box.value);
-
-                            // Take right subtree of left_child
-                            let left_right = left_child.right.take();
-
-                            // Construct the right subtree - the original right and the right of left_child
-                            if let Some(lr) = left_right {
-                                // We have a right subtree from the left child
-                                // Create a new right subtree by "joining" the two subtrees
-
-                                // Perform a simple join (this is a simplified approach)
-                                let mut right_tree = old_right;
-                                let mut current = &mut right_tree;
-
-                                // Find leftmost position to insert
-                                while let Some(ref mut node) = *current {
-                                    current = &mut node.left;
-                                }
-
-                                // Insert the left's right subtree
-                                *current = Some(lr);
-
-                                left_child.right = right_tree;
-                            } else {
-                                // No right subtree from left child, just use the original right
-                                left_child.right = old_right;
-                            }
-
-                            Some(left_child)
+                            // Left child has lower priority, rotate right
+                            let mut rotated = Self::rotate_right(Some(node_box)).unwrap();
+                            // The target key is now in rotated.right, recurse
+                            rotated.right = Self::remove_rec(rotated.right.take(), key, result);
+                            Some(rotated)
                         } else {
-                            // Right child has higher or equal priority, it becomes the new root
-                            // Take ownership of the children to manipulate them
-                            let mut right_child = node_box.right.take().unwrap();
-                            let old_left = node_box.left.take();
-
-                            // Store the result value before dropping node_box
-                            *result = Some(node_box.value);
-
-                            // Take left subtree of right_child
-                            let right_left = right_child.left.take();
-
-                            // Construct the left subtree - the original left and the left of right_child
-                            if let Some(rl) = right_left {
-                                // We have a left subtree from the right child
-                                // Create a new left subtree by "joining" the two subtrees
-
-                                // Perform a simple join (this is a simplified approach)
-                                let mut left_tree = old_left;
-                                let mut current = &mut left_tree;
-
-                                // Find rightmost position to insert
-                                while let Some(ref mut node) = *current {
-                                    current = &mut node.right;
-                                }
-
-                                // Insert the right's left subtree
-                                *current = Some(rl);
-
-                                right_child.left = left_tree;
-                            } else {
-                                // No left subtree from right child, just use the original left
-                                right_child.left = old_left;
-                            }
-
-                            Some(right_child)
+                            // Right child has lower or equal priority, rotate left
+                            let mut rotated = Self::rotate_left(Some(node_box)).unwrap();
+                            // The target key is now in rotated.left, recurse
+                            rotated.left = Self::remove_rec(rotated.left.take(), key, result);
+                            Some(rotated)
                         }
                     }
                 }
@@ -317,14 +264,60 @@ impl<K: Ord + Clone, V, P: Ord + Clone> Default for Treap<K, V, P> {
 mod tests {
     use super::*;
 
+    /// Verify both BST ordering and min-heap priority invariants for the entire tree.
+    fn assert_invariants<K: Ord + Clone + std::fmt::Debug, V, P: Ord + Clone + std::fmt::Debug>(
+        treap: &Treap<K, V, P>,
+    ) {
+        fn check<K: Ord + Clone + std::fmt::Debug, V, P: Ord + Clone + std::fmt::Debug>(
+            node: &Option<Box<TreapNode<K, V, P>>>,
+            min_key: Option<&K>,
+            max_key: Option<&K>,
+            parent_priority: Option<&P>,
+        ) {
+            let Some(n) = node else { return };
+
+            // BST property: min_key < n.key < max_key
+            if let Some(min) = min_key {
+                assert!(
+                    n.key > *min,
+                    "BST violation: {:?} should be > {:?}",
+                    n.key,
+                    min
+                );
+            }
+            if let Some(max) = max_key {
+                assert!(
+                    n.key < *max,
+                    "BST violation: {:?} should be < {:?}",
+                    n.key,
+                    max
+                );
+            }
+
+            // Min-heap property: parent.priority <= child.priority
+            if let Some(pp) = parent_priority {
+                assert!(
+                    n.priority >= *pp,
+                    "Heap violation: node {:?} priority {:?} < parent priority {:?}",
+                    n.key,
+                    n.priority,
+                    pp
+                );
+            }
+
+            check(&n.left, min_key, Some(&n.key), Some(&n.priority));
+            check(&n.right, Some(&n.key), max_key, Some(&n.priority));
+        }
+
+        check(&treap.root, None, None, None);
+    }
+
     #[test]
     fn verify_min_priority_node() {
         let mut treap = Treap::new();
 
         assert_eq!(None, treap.get_min_priority_node());
 
-        // Insert some values with custom priorities.
-        //
         treap.insert(5, "five", 50);
         assert_eq!(Some((&5, &"five", &50)), treap.get_min_priority_node());
 
@@ -340,75 +333,110 @@ mod tests {
         treap.insert(4, "four", 40);
         assert_eq!(Some((&1, &"one", &10)), treap.get_min_priority_node());
 
-        // Verify contains.
-        //
-        assert_eq!(true, treap.contains(&5));
-        assert_eq!(false, treap.contains(&6));
+        assert!(treap.contains(&5));
+        assert!(!treap.contains(&6));
+        assert_invariants(&treap);
 
-        // Display in-order traversal with priorities.
-        //
-        println!("In-order traversal:");
-        treap.in_order_traversal(|key, value, priority| {
-            println!("Key: {}, Value: {}, Priority: {}", key, value, priority)
-        });
-
-        // Remove element with minimum priority (returns both key and value).
-        //
+        // Remove min-priority element, verify invariants hold
         let (key, _, _) = treap.get_min_priority_node().unwrap();
         assert_eq!(&1, key);
         assert_eq!(Some("one"), treap.remove(&key.clone()));
+        assert_invariants(&treap);
 
-        // Remove another element with minimum priority (returns only the value).
-        //
         let (key, _, _) = treap.get_min_priority_node().unwrap();
         assert_eq!(&2, key);
         assert_eq!(Some("two"), treap.remove(&key.clone()));
-
-        // Display after removal
-        println!("After removing min priority elements:");
-        treap.in_order_traversal(|key, value, priority| {
-            println!("Key: {}, Value: {}, Priority: {}", key, value, priority)
-        });
+        assert_invariants(&treap);
     }
 
     #[test]
     fn remove_twice() {
         let mut treap = Treap::new();
 
-        // Insert some values with custom priorities.
-        //
         treap.insert(5, "five", 50);
         treap.insert(2, "two", 20);
         treap.insert(7, "seven", 70);
 
         assert_eq!(Some("five"), treap.remove(&5));
         assert_eq!(None, treap.remove(&5));
+        assert_invariants(&treap);
     }
 
     #[test]
     fn verify_contains() {
         let mut treap = Treap::new();
 
-        // Insert some values with custom priorities.
-        //
         treap.insert(1, "one", 1);
         treap.insert(2, "two", 2);
         treap.insert(3, "three", 3);
 
-        assert_eq!(true, treap.contains(&2));
-        assert_eq!(false, treap.contains(&5));
+        assert!(treap.contains(&2));
+        assert!(!treap.contains(&5));
     }
 
     #[test]
     fn verify_gets() {
         let mut treap = Treap::new();
 
-        // Insert some values with custom priorities.
-        //
         treap.insert(100, "100", 100);
         treap.insert(200, "200", 200);
         treap.insert(300, "300", 300);
 
         assert_eq!(Some(&"200"), treap.get(&200));
+    }
+
+    #[test]
+    fn remove_root_with_two_children() {
+        let mut treap = Treap::new();
+
+        // Build a tree where root has two children
+        treap.insert(5, "five", 10); // root (lowest priority)
+        treap.insert(3, "three", 30);
+        treap.insert(7, "seven", 20);
+        treap.insert(1, "one", 50);
+        treap.insert(4, "four", 40);
+        treap.insert(6, "six", 60);
+        treap.insert(9, "nine", 35);
+        assert_invariants(&treap);
+
+        // Remove root - this exercises Case 3 (two children)
+        assert_eq!(Some("five"), treap.remove(&5));
+        assert_invariants(&treap);
+        assert!(!treap.contains(&5));
+
+        // All other keys still present
+        assert!(treap.contains(&3));
+        assert!(treap.contains(&7));
+        assert!(treap.contains(&1));
+        assert!(treap.contains(&4));
+        assert!(treap.contains(&6));
+        assert!(treap.contains(&9));
+
+        // Min priority should now be 7/seven (priority 20)
+        let (key, _, priority) = treap.get_min_priority_node().unwrap();
+        assert_eq!(&7, key);
+        assert_eq!(&20, priority);
+    }
+
+    #[test]
+    fn remove_all_elements() {
+        let mut treap = Treap::new();
+
+        treap.insert(5, 5, 50);
+        treap.insert(3, 3, 30);
+        treap.insert(8, 8, 80);
+        treap.insert(1, 1, 10);
+        treap.insert(4, 4, 40);
+        treap.insert(7, 7, 70);
+        treap.insert(9, 9, 90);
+
+        // Remove all in an order that forces various rotation patterns
+        for &key in &[5, 1, 9, 3, 7, 4, 8] {
+            assert_eq!(Some(key), treap.remove(&key));
+            assert_invariants(&treap);
+            assert!(!treap.contains(&key));
+        }
+
+        assert_eq!(None, treap.get_min_priority_node());
     }
 }

@@ -3,8 +3,10 @@ resolver = "2"
 members = [
   "starfish-core",
   "starfish-crossbeam",
+  "starfish-db",
   "starfish-epoch",
   "starfish-http",
+  "starfish-quic",
   "starfish-reactor",
   "starfish-storage",
   "starfish-tls",

@@ -1,3 +1,8 @@
+//! Async-aware file open options.
+//!
+//! Provides the `AsyncOpenOptions` trait and `FileOpenOptions` wrapper that extend
+//! `std::fs::OpenOptions` to open files for use with the cooperative async I/O system.
+
 use std::fs::OpenOptions;
 use std::io;
 use std::path::Path;

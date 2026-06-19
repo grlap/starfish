@@ -1,3 +1,8 @@
+//! Cooperative async TCP listener.
+//!
+//! Provides `TcpListener` for binding to a local address and accepting incoming
+//! TCP connections asynchronously within the reactor's cooperative scheduler.
+
 use std::{
     io,
     net::{self, ToSocketAddrs},

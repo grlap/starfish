@@ -350,6 +350,18 @@ impl<T: ?Sized, L: Lock<T>> LockExt<T> for L {}
 
 // Implements Synchronization FairLock.
 //
+/// Cooperative fair lock backed by an `Arc<FairLock<T>>`.
+///
+/// `CooperativeFairLock<T>` is `Send + Sync` only when `T: Send`, matching
+/// `std::sync::Mutex` semantics. Non-`Send` payloads are rejected at compile time:
+///
+/// ```compile_fail
+/// use std::rc::Rc;
+/// use starfish_reactor::cooperative_synchronization::lock::CooperativeFairLock;
+/// fn assert_send<T: Send>() {}
+/// // Rc is !Send, so CooperativeFairLock<Rc<()>> must not be Send.
+/// assert_send::<CooperativeFairLock<Rc<()>>>();
+/// ```
 pub struct CooperativeFairLock<T: ?Sized>(ArcPointer<FairLock<T>>);
 
 impl<T> CooperativeFairLock<T> {
@@ -392,6 +404,9 @@ impl<T> FairLock<T> {
         match self.lock_sync.try_acquire_owner() {
             true => Some(LockResult {
                 lock: self,
+                // SAFETY: We just acquired ownership via successful CAS in
+                // try_acquire_owner(), guaranteeing exclusive access to the
+                // UnsafeCell contents.
                 data: unsafe { &mut *self.data.get() },
             }),
             false => None,
@@ -404,6 +419,8 @@ impl<T> FairLock<T> {
 
         LockResult {
             lock: self,
+            // SAFETY: acquire_internal() completed, meaning we own the lock
+            // and have exclusive access to the UnsafeCell contents.
             data: unsafe { &mut *self.data.get() },
         }
     }
@@ -438,8 +455,14 @@ impl<T: ?Sized> Lock<T> for FairLock<T> {
     }
 }
 
-unsafe impl<T: ?Sized> Send for FairLock<T> {}
-unsafe impl<T: ?Sized> Sync for FairLock<T> {}
+// SAFETY: FairLock<T> is Send when T: Send because the lock transfers exclusive
+// ownership of T between threads via its atomic state machine. The LockSync
+// fields (AtomicU8, SegQueue) are themselves Send+Sync.
+unsafe impl<T: ?Sized + Send> Send for FairLock<T> {}
+// SAFETY: FairLock<T> is Sync when T: Send because the lock guarantees mutual
+// exclusion — only one thread accesses T at a time, so T is never concurrently
+// shared. T: Sync is not required (matching std::sync::Mutex semantics).
+unsafe impl<T: ?Sized + Send> Sync for FairLock<T> {}
 
 // Implements Synchronization Unfair Lock.
 //
@@ -487,6 +510,9 @@ impl<T> UnfairLock<T> {
         match self.lock_sync.try_acquire_owner() {
             true => Some(LockResult {
                 lock: self,
+                // SAFETY: We just acquired ownership via successful CAS in
+                // try_acquire_owner(), guaranteeing exclusive access to the
+                // UnsafeCell contents.
                 data: unsafe { &mut *self.data.get() },
             }),
             false => None,
@@ -499,6 +525,8 @@ impl<T> UnfairLock<T> {
 
         LockResult {
             lock: self,
+            // SAFETY: acquire_internal() completed, meaning we own the lock
+            // and have exclusive access to the UnsafeCell contents.
             data: unsafe { &mut *self.data.get() },
         }
     }
@@ -553,8 +581,15 @@ impl<T: Sized> Lock<T> for UnfairLock<T> {
     }
 }
 
-unsafe impl<T: ?Sized> Send for UnfairLock<T> {}
-unsafe impl<T: ?Sized> Sync for UnfairLock<T> {}
+// SAFETY: UnfairLock<T> is Send when T: Send because the lock transfers
+// exclusive ownership of T between threads. The RefCell<Vec<..>> waiters field
+// is only accessed inside release() while the lock is held, so no concurrent
+// RefCell access occurs despite RefCell being !Sync.
+unsafe impl<T: ?Sized + Send> Send for UnfairLock<T> {}
+// SAFETY: UnfairLock<T> is Sync when T: Send because mutual exclusion ensures
+// only one thread accesses T (and the RefCell waiters) at a time. See Send
+// comment above for RefCell reasoning.
+unsafe impl<T: ?Sized + Send> Sync for UnfairLock<T> {}
 
 // Implements Synchronization Reactor-Aware Lock.
 // Selects the waiter on the least loaded reactor.
@@ -607,6 +642,9 @@ impl<T> ReactorAwareLock<T> {
         match self.lock_sync.try_acquire_owner() {
             true => Some(LockResult {
                 lock: self,
+                // SAFETY: We just acquired ownership via successful CAS in
+                // try_acquire_owner(), guaranteeing exclusive access to the
+                // UnsafeCell contents.
                 data: unsafe { &mut *self.data.get() },
             }),
             false => None,
@@ -619,6 +657,8 @@ impl<T> ReactorAwareLock<T> {
 
         LockResult {
             lock: self,
+            // SAFETY: acquire_internal() completed, meaning we own the lock
+            // and have exclusive access to the UnsafeCell contents.
             data: unsafe { &mut *self.data.get() },
         }
     }
@@ -701,8 +741,15 @@ impl<T: Sized> Lock<T> for ReactorAwareLock<T> {
     }
 }
 
-unsafe impl<T: ?Sized> Send for ReactorAwareLock<T> {}
-unsafe impl<T: ?Sized> Sync for ReactorAwareLock<T> {}
+// SAFETY: ReactorAwareLock<T> is Send when T: Send because the lock transfers
+// exclusive ownership of T between threads. The RefCell fields (waiters,
+// scan_counter) are only accessed inside release() while the lock is held, so
+// no concurrent RefCell access occurs despite RefCell being !Sync.
+unsafe impl<T: ?Sized + Send> Send for ReactorAwareLock<T> {}
+// SAFETY: ReactorAwareLock<T> is Sync when T: Send because mutual exclusion
+// ensures only one thread accesses T (and the RefCell fields) at a time. See
+// Send comment above for RefCell reasoning.
+unsafe impl<T: ?Sized + Send> Sync for ReactorAwareLock<T> {}
 
 // Lock result.
 //

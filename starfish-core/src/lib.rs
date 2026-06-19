@@ -1,4 +1,8 @@
-#![allow(dead_code)]
+//! Core data structures and utilities for the Starfish runtime.
+//!
+//! Provides lock-free collections (`SkipList`, `SortedList`, `SplitOrderedHashMap`,
+//! `SkipTrie`, `YFastTrie`, `Treap`), the `Guard` trait for pluggable memory reclamation,
+//! and preemptive synchronization primitives (`CountdownEvent`).
 
 pub mod common_tests;
 pub mod data_structures;

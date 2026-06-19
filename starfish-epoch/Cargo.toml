@@ -5,5 +5,7 @@ edition = "2024"
 
 [dependencies]
 mimalloc = { version = "0.1.48", features = ["v3"] }
-starfish-core = { version = "0.1.0", path = "../starfish-core" }
 starfish-reactor = { version = "0.1.0", path = "../starfish-reactor" }
+
+[dev-dependencies]
+starfish-core = { version = "0.1.0", path = "../starfish-core" }

@@ -42,11 +42,34 @@ Cross-platform async I/O reactor with cooperative multitasking for the Starfish 
 └───────────────────────────────────────────────────────────┘
 ```
 
+## Modules
+
+| Module | Description |
+|--------|-------------|
+| `reactor` | Core reactor implementing cooperative scheduling of futures |
+| `coordinator` | Multi-reactor coordination for parallel cooperative scheduling |
+| `cooperative_io` | Async I/O abstractions and platform-specific backends |
+| `cooperative_io::async_read` | Asynchronous read trait and extension methods |
+| `cooperative_io::async_write` | Asynchronous write trait and extension methods |
+| `cooperative_io::file` | Cooperative async file I/O |
+| `cooperative_io::file_open_options` | Async-aware file open options |
+| `cooperative_io::tcp_listener` | Cooperative async TCP listener |
+| `cooperative_io::tcp_stream` | Cooperative async TCP stream |
+| `cooperative_io::udp_socket` | Cooperative async UDP socket |
+| `cooperative_io::io_manager` | I/O manager trait and associated types |
+| `cooperative_io::io_timeout` | I/O timeout specification for async operations |
+| `cooperative_synchronization` | Cooperative synchronization primitives for the reactor |
+| `cooperative_synchronization::event_future` | Multi-waiter cooperative event future |
+| `cooperative_synchronization::wait_one_future` | One-shot cooperative wait/signal future |
+| `cooperative_synchronization::delayed_future` | Cooperative sleep and delayed execution |
+| `cooperative_synchronization::lock` | Cooperative locks for async reactors |
+| `rc_pointer` | Single-threaded and atomic reference-counted smart pointers |
+
 ## Platform Backends
 
 | Platform | Backend | Description |
 |----------|---------|-------------|
-| Linux | io_uring | High-performance kernel async I/O (requires kernel 5.1+) |
+| Linux | io_uring | High-performance kernel async I/O (kernel 5.19+ for clean teardown via `IORING_ASYNC_CANCEL_ANY`; older kernels leak in-flight ops at reactor drop) |
 | macOS | kqueue | BSD event notification interface |
 | Windows | IOCP | I/O Completion Ports |
 
@@ -191,24 +214,31 @@ let mut buf = vec![0u8; 1024];
 let n = stream.read(&mut buf).await?;
 
 // TCP Server
-let listener = TcpListener::bind("127.0.0.1:8080".parse().unwrap()).await?;
-let (mut client, addr) = listener.accept().await?;
-println!("Connection from {}", addr);
+let mut listener = TcpListener::bind("127.0.0.1:8080").await?;
+let mut client = listener.accept().await?;
 ```
 
 ### UDP Networking
 
 ```rust
-use starfish_reactor::cooperative_io::udp_socket::UdpSocket;
+use starfish_reactor::cooperative_io::udp_socket::{UdpEcnCodepoint, UdpSocket};
 
-let socket = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).await?;
+let mut socket = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).await?;
 
 // Send datagram
-socket.send_to(b"Hello", "127.0.0.1:8080".parse().unwrap()).await?;
+let mut data = b"Hello".to_vec();
+let dest: std::net::SocketAddr = "127.0.0.1:8080".parse().unwrap();
+socket.send_to(dest, &mut data).await?;
 
 // Receive datagram
 let mut buf = vec![0u8; 1024];
 let (n, addr) = socket.recv_from(&mut buf).await?;
+
+// Optional ECN-aware UDP APIs
+socket
+    .send_to_with_ecn(dest, &mut data, Some(UdpEcnCodepoint::Ect0))
+    .await?;
+let (n, addr, ecn) = socket.recv_from_with_ecn(&mut buf).await?;
 ```
 
 ### I/O Timeouts
@@ -217,7 +247,7 @@ let (n, addr) = socket.recv_from(&mut buf).await?;
 use starfish_reactor::cooperative_io::io_timeout::IOTimeout;
 use std::time::Duration;
 
-let timeout = Some(IOTimeout::new(Duration::from_secs(5)));
+let timeout = Some(IOTimeout::from_duration(Duration::from_secs(5)));
 
 // Read with timeout
 let result = file.read_with_timeout(&mut buffer, &timeout).await;
@@ -238,12 +268,12 @@ let event = reactor.create_event();
 
 // In one task: wait for event
 reactor.spawn(async move {
-    event.wait().await;
+    event.cooperative_wait().await;
     println!("Event signaled!");
 });
 
 // In another task: signal event
-event.set();
+event.signal();
 ```
 
 ### Fair Locks
@@ -253,7 +283,7 @@ let reactor = Reactor::local_instance();
 let lock = reactor.create_fair_lock(0i32);
 
 reactor.spawn(async move {
-    let mut guard = lock.lock().await;
+    let mut guard = lock.acquire().await;
     *guard += 1;
     // Lock automatically released when guard is dropped
 });

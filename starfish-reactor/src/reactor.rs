@@ -1,9 +1,18 @@
+//! Core reactor implementing cooperative scheduling of futures.
+//!
+//! Provides the `Reactor` struct, which drives futures to completion on a single thread,
+//! and `FutureRuntimeTrait` / `ScheduleReason` for managing task lifecycle and wake-up
+//! scheduling within the cooperative runtime. External task spawning (`spawn_external`)
+//! supports both cooperative completion (when called from a reactor thread) and preemptive
+//! completion via `CountdownEvent` (when called from a non-reactor thread).
+
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::SystemTime;
@@ -12,6 +21,7 @@ use std::{io, ptr};
 use binary_heap_plus::{BinaryHeap, MinComparator};
 use crossbeam::queue::SegQueue;
 
+use crate::completion_signaler::{CompletionSignaler, ExternalCompletionWaiter};
 use crate::cooperative_io::io_manager::{IOManager, IOManagerCreateOptions, IOManagerHolder};
 use crate::cooperative_io::io_wait_future::IOWaitFuture;
 use crate::cooperative_synchronization::event_future::{CooperativeEventFuture, EventFuture};
@@ -20,6 +30,7 @@ use crate::cooperative_synchronization::wait_one_future::CooperativeWaitOneFutur
 use crate::cooperative_synchronization::wait_one_future::CooperativeWaitOneSignaler;
 use crate::rc_pointer::RcPointer;
 use starfish_core::data_structures::Treap;
+use starfish_core::preemptive_synchronization::countdown_event::CountdownEvent;
 
 pub trait ReactorAssigned {
     fn assigned_reactor(&self) -> Option<&Reactor>;
@@ -54,17 +65,17 @@ pub(crate) trait FutureRuntimeTrait {
 }
 
 // Generic future runtime that stores the future inline (no separate Box allocation).
-// Uses CooperativeWaitOneSignaler for signaling.
+// Uses either cooperative or preemptive completion signaling.
 //
 pub struct FutureRuntimeImpl<F: Future<Output = ()>> {
     future: F,
     is_first_yield: bool,
     execution_count: u32,
-    completed_signaler: CooperativeWaitOneSignaler,
+    completed_signaler: CompletionSignaler,
 }
 
 impl<F: Future<Output = ()>> FutureRuntimeImpl<F> {
-    fn new(future: F, completed_signaler: CooperativeWaitOneSignaler) -> Self {
+    fn new(future: F, completed_signaler: CompletionSignaler) -> Self {
         FutureRuntimeImpl {
             future,
             is_first_yield: true,
@@ -151,6 +162,35 @@ impl PartialEq for ScheduledFutureRuntime {
     }
 }
 
+/// A shared result slot for passing a value from a producer future to a consumer future.
+///
+/// # Safety
+/// `Send + Sync` is sound because access is sequenced by a completion event:
+/// the producer writes before signaling, the consumer reads only after the event fires.
+/// There is no concurrent access to the inner `UnsafeCell`.
+struct ResultExternalFuture<T>(UnsafeCell<Option<T>>);
+
+unsafe impl<T: Send> Send for ResultExternalFuture<T> {}
+unsafe impl<T: Send> Sync for ResultExternalFuture<T> {}
+
+impl<T> ResultExternalFuture<T> {
+    fn new() -> Self {
+        ResultExternalFuture(UnsafeCell::new(None))
+    }
+
+    /// # Safety
+    /// Must only be called by the producer, before signaling completion.
+    unsafe fn set(&self, value: T) {
+        unsafe { *self.0.get() = Some(value) }
+    }
+
+    /// # Safety
+    /// Must only be called by the consumer, after the completion event fires.
+    unsafe fn take(&self) -> T {
+        unsafe { (*self.0.get()).take().unwrap() }
+    }
+}
+
 // Defines a Cooperative Reactor.
 //
 pub struct Reactor {
@@ -163,7 +203,33 @@ pub struct Reactor {
     io_manager: Box<dyn IOManager>,
     index: usize,
     is_in_shutdown: AtomicBool,
+    /// Consecutive external futures executed; bounds external priority so a
+    /// sustained cross-reactor feed cannot starve I/O completion delivery.
+    external_streak: u32,
+    /// Consecutive loop iterations that found nothing runnable; gates the
+    /// idle-spin window before the reactor blocks in `wait_for_io`.
+    idle_streak: u32,
+    /// True while this reactor is (about to be) blocked in `wait_for_io`.
+    /// Senders check it after pushing work and call `IOManager::wake()`.
+    /// The store-buffering handshake (SeqCst fences on both sides — see
+    /// `run()` and `enqueue_external_future_runtime`) is what makes a lost
+    /// wakeup impossible; plain Release/Acquire would not. Cache-padded:
+    /// senders read it on every external enqueue, and without padding it
+    /// would share a line with the reactor's hot private counters
+    /// (idle_streak/external_streak), turning every idle-loop write into
+    /// cross-core traffic.
+    sleeping: crossbeam::utils::CachePadded<AtomicBool>,
 }
+
+/// After this many consecutive external picks, I/O completions get one turn.
+/// Externals keep ~STREAK/(STREAK+1) of the reactor under sustained pressure.
+const EXTERNAL_PRIORITY_STREAK: u32 = 8;
+
+/// Idle loop iterations before the reactor blocks in the kernel. Each idle
+/// iteration is a few hundred nanoseconds of queue checks, so this absorbs
+/// transient lulls of tens of microseconds without paying the sleep/wake
+/// syscall round-trip (Seastar's "idle polling" phase).
+const IDLE_SPIN_ITERATIONS: u32 = 256;
 
 impl Reactor {
     pub fn new() -> Self {
@@ -195,6 +261,9 @@ impl Reactor {
             io_manager: io_manager_holder.io_manager,
             index: 0,
             is_in_shutdown: AtomicBool::new(true),
+            external_streak: 0,
+            idle_streak: 0,
+            sleeping: crossbeam::utils::CachePadded::new(AtomicBool::new(false)),
         }
     }
 
@@ -203,6 +272,31 @@ impl Reactor {
     #[inline]
     pub(super) fn set_schedule_reason(&mut self, reason: ScheduleReason) {
         self.schedule_reason = reason;
+    }
+
+    /// Takes the next completed I/O future from the I/O manager, dropping its
+    /// entry from the timeout collection if it carried a timeout.
+    ///
+    fn take_completed_io(&mut self) -> Option<FutureRuntime> {
+        if !self.io_manager.has_active_io() {
+            return None;
+        }
+
+        let (future_runtime, io_wait_future_ptr) = self.io_manager.completed_io()?;
+
+        // SAFETY: the manager only delivers pointers to IOWaitFutures whose
+        // owning task box it just handed back in `future_runtime` — the
+        // pointee is alive until that runtime is dropped or completed.
+        let io_wait_future = unsafe { &*io_wait_future_ptr };
+
+        if io_wait_future.timeout().is_some() {
+            // If completed IOWaitFuture has timeout, remove the future from io_futures_with_timeout.
+            //
+            let const_ptr: *const IOWaitFuture = io_wait_future_ptr;
+            self.io_futures_with_timeout.remove(&const_ptr);
+        }
+
+        Some(future_runtime)
     }
 
     // Main event loop for the reactor.
@@ -220,12 +314,12 @@ impl Reactor {
         let mut should_run = true;
 
         while should_run {
-            // Cancel timeouted IOWaitFutures.
+            // Cancel timed-out IOWaitFutures.
             //
             while let Some((key, _, timeout)) = self.io_futures_with_timeout.get_min_priority_node()
             {
-                if *timeout >= SystemTime::now() {
-                    // IOWaiteFuture expired. Cancel outstanding IO, ignore any errors.
+                if *timeout <= SystemTime::now() {
+                    // IOWaitFuture expired. Cancel outstanding IO, ignore any errors.
                     //
                     let io_wait_future_ptr =
                         self.io_futures_with_timeout.remove(&key.clone()).unwrap();
@@ -238,29 +332,43 @@ impl Reactor {
                 }
             }
 
-            // Handle external futures first.
+            // External futures run first and directly: a cross-reactor spawn
+            // has another CPU blocked on the handoff, so every queue hop is
+            // cross-core latency. The priority is bounded by a streak valve —
+            // after EXTERNAL_PRIORITY_STREAK consecutive external picks, I/O
+            // completions get one turn — so a sustained external feed cannot
+            // strand in-flight I/O forever (including the cancellation
+            // completion that resumes a timed-out task).
             //
-            let mut option_future_runtime = self.external_futures.pop();
+            let give_io_turn = self.external_streak >= EXTERNAL_PRIORITY_STREAK;
 
-            if option_future_runtime.is_none() && self.io_manager.has_active_io() {
-                let completed_io = self.io_manager.completed_io();
+            let mut option_future_runtime = if give_io_turn {
+                self.take_completed_io()
+            } else {
+                None
+            };
 
-                if let Some((future_runtime, io_wait_future_ptr)) = completed_io {
-                    option_future_runtime = Some(future_runtime);
+            if option_future_runtime.is_some() {
+                self.external_streak = 0;
+            } else {
+                option_future_runtime = self.external_futures.pop();
 
-                    let io_wait_future = unsafe { &*io_wait_future_ptr };
+                if option_future_runtime.is_some() {
+                    // Saturating: only the >= EXTERNAL_PRIORITY_STREAK
+                    // comparison matters, and a sustained feed with no I/O
+                    // active would otherwise overflow the counter.
+                    self.external_streak = self.external_streak.saturating_add(1);
+                } else {
+                    self.external_streak = 0;
 
-                    if io_wait_future.timeout().is_some() {
-                        // If completed IOWaitFuture has timeout, remove the future from io_futures_with_timeout.
-                        //
-                        let const_ptr: *const IOWaitFuture = io_wait_future_ptr as *const _;
-                        self.io_futures_with_timeout.remove(&const_ptr);
+                    if !give_io_turn {
+                        option_future_runtime = self.take_completed_io();
                     }
                 }
             }
+
             // Handle timers.
             //
-
             if option_future_runtime.is_none() && !self.delayed_futures.is_empty() {
                 let now = SystemTime::now();
 
@@ -283,8 +391,105 @@ impl Reactor {
                     || self.io_manager.has_active_io()
                     || !self.external_futures.is_empty()
                     || !self.delayed_futures.is_empty();
+
+                if !should_run {
+                    continue;
+                }
+
+                // Idle phases (former trackers #5/#59): spin briefly for
+                // latency, then block in the kernel instead of burning the
+                // core.
+                //
+                // Phase 1 — spin window: absorb transient lulls without the
+                // sleep/wake syscall round-trip.
+                //
+                self.idle_streak = self.idle_streak.saturating_add(1);
+                if self.idle_streak < IDLE_SPIN_ITERATIONS {
+                    continue;
+                }
+
+                // Phase 2 — bound the sleep by the earliest deadline from
+                // EITHER deadline source: delayed futures (timers) or the
+                // I/O-timeout Treap (a sleeping reactor must still wake to
+                // cancel an expired I/O operation). None = neither exists;
+                // sleep until I/O completes or a wake arrives.
+                //
+                let timer_deadline = self
+                    .delayed_futures
+                    .peek()
+                    .map(|delayed_future| delayed_future.activate_system_time);
+                let io_timeout_deadline = self
+                    .io_futures_with_timeout
+                    .get_min_priority_node()
+                    .map(|(_, _, deadline)| *deadline);
+
+                let earliest_deadline = match (timer_deadline, io_timeout_deadline) {
+                    (Some(timer), Some(io)) => Some(timer.min(io)),
+                    (deadline, None) | (None, deadline) => deadline,
+                };
+
+                // Clock-domain note: deadlines are wall-clock (SystemTime,
+                // pre-existing design — see tracker #62/#68 for the Instant
+                // migration), but the kernel sleep measures the relative
+                // duration monotonically. A wall-clock step during the sleep
+                // therefore shifts firing by the step size at most once; the
+                // old busy-spin re-read the wall clock continuously and would
+                // mass-expire instead.
+                let sleep_timeout = earliest_deadline.map(|deadline| {
+                    deadline
+                        .duration_since(SystemTime::now())
+                        .unwrap_or(std::time::Duration::ZERO)
+                });
+
+                if matches!(sleep_timeout, Some(duration) if duration.is_zero()) {
+                    // A deadline is already due; loop around and service it.
+                    continue;
+                }
+
+                // Phase 3 — sleeping-flag handshake, then block.
+                //
+                // Sender side (enqueue_external_future_runtime): push; SeqCst
+                // fence; if sleeping { wake() }. Sleeper side (here): store
+                // sleeping; SeqCst fence; re-check the queue; block. The
+                // paired fences guarantee at least one side observes the
+                // other — without them this is the classic store-buffering
+                // lost wakeup (sleeper misses the push AND sender misses the
+                // flag). I/O completions need no flag: entering the kernel
+                // wait observes already-arrived CQEs atomically.
+                //
+                self.sleeping
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+
+                let shutdown_exit_ready = self
+                    .is_in_shutdown
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    && !self.io_manager.has_active_io()
+                    && self.delayed_futures.is_empty();
+
+                if !self.external_futures.is_empty() || shutdown_exit_ready {
+                    // Work raced in, or the loop became exit-eligible
+                    // (shutdown setters wake us, but may have checked the
+                    // flag before we set it — this re-check closes that half
+                    // of the race). Sleeping during a shutdown DRAIN is fine:
+                    // pending I/O completions and timer deadlines both end
+                    // the wait on their own.
+                    self.sleeping
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    self.idle_streak = 0;
+                    continue;
+                }
+
+                let _ = self.io_manager.wait_for_io(sleep_timeout);
+
+                self.sleeping
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                self.idle_streak = 0;
+
                 continue;
             }
+
+            self.idle_streak = 0;
 
             // Process Future.
             //
@@ -349,8 +554,7 @@ impl Reactor {
                                 .set_first_yield(true)
                         };
 
-                        let wait_one_future =
-                            unsafe { &mut *(wait_one_future_ptr as *mut CooperativeWaitOneFuture) };
+                        let wait_one_future = unsafe { &*wait_one_future_ptr };
                         wait_one_future.set_waiting(future_runtime);
                     }
                     ScheduleReason::IOWait(io_wait_future_ptr) => {
@@ -372,7 +576,7 @@ impl Reactor {
                         // If IOWaitFuture has timeout, register it.
                         //
                         if let Some(timeout) = io_wait_future.timeout() {
-                            self.register_timeouted_io_wait_future(
+                            self.register_timed_out_io_wait_future(
                                 io_wait_future,
                                 timeout.cancel_at_time(),
                             )
@@ -381,9 +585,21 @@ impl Reactor {
                         match io_result {
                             Ok(_) => {}
                             Err(io_error) => {
-                                // We failed to register pending IO.
-                                //
+                                // Registration failed. Store the error and
+                                // re-enqueue the task so it gets polled and
+                                // sees the Err. push_front for I/O priority.
+                                // Also remove any registered timeout: the task
+                                // will be polled directly, so the entry is stale.
+                                // Leaving it would cause cancel_io_wait to fire on
+                                // a future that has already been re-enqueued, producing
+                                // a UAF on Windows and an active_io imbalance on Linux.
+                                if io_wait_future.timeout().is_some() {
+                                    self.unregister_timed_out_io_wait_future(io_wait_future_ptr);
+                                }
                                 io_wait_future.set_io_result(Err(io_error));
+                                if let Some(future_runtime) = io_wait_future.take_future_runtime() {
+                                    self.active_futures.borrow_mut().push_front(future_runtime);
+                                }
                             }
                         }
                     }
@@ -451,7 +667,7 @@ impl Reactor {
         &self,
         future: F,
     ) -> impl Future<Output = ()> + use<F> {
-        let (mut completed_event_wait, copleted_event_signaler) = self.create_wait_one();
+        let (mut completed_event_wait, completed_event_signaler) = self.create_wait_one();
 
         // Single allocation: Box contains both FutureRuntimeImpl and the future inline.
         //
@@ -459,7 +675,7 @@ impl Reactor {
             .borrow_mut()
             .push_back(Box::pin(FutureRuntimeImpl::new(
                 future,
-                copleted_event_signaler,
+                CompletionSignaler::Cooperative(completed_event_signaler),
             )));
 
         async move {
@@ -471,8 +687,16 @@ impl Reactor {
         self.active_futures.borrow_mut().append(incoming_futures);
     }
 
-    pub(crate) fn enqueue_external_feature_runtime(&self, future_runtime: FutureRuntime) {
+    pub(crate) fn enqueue_external_future_runtime(&self, future_runtime: FutureRuntime) {
         self.external_futures.push(future_runtime);
+
+        // Sender half of the sleeping handshake (see run()): the SeqCst
+        // fences pair so that either this load sees the sleeper's flag, or
+        // the sleeper's post-flag re-check sees our push — never neither.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        if self.sleeping.load(std::sync::atomic::Ordering::Relaxed) {
+            self.io_manager.wake();
+        }
     }
 
     // Adds a Future with the result to the active queue.
@@ -481,15 +705,14 @@ impl Reactor {
         &self,
         future: F,
     ) -> impl Future<Output = T> + use<T, F> {
-        let pinned_result_ptr_addr = Box::into_raw(Box::new(None::<T>)) as usize;
+        let result_consumer = Arc::new(ResultExternalFuture::new());
+        let result_producer = Arc::clone(&result_consumer);
 
         let cooperative_future = async move {
             let result = future.await;
 
-            unsafe {
-                let pinned_result_ptr = pinned_result_ptr_addr as *mut Option<T>;
-                *pinned_result_ptr = Some(result);
-            }
+            // SAFETY: Producer writes before signaling completion.
+            unsafe { result_producer.set(result) };
         };
 
         let completed_event = self.spawn(cooperative_future);
@@ -497,17 +720,8 @@ impl Reactor {
         async move {
             completed_event.await;
 
-            unsafe {
-                let pinned_result_ptr = pinned_result_ptr_addr as *mut Option<T>;
-                // Convert raw pointer back to Box (reclaims ownership).
-                //
-                let boxed = Box::from_raw(pinned_result_ptr);
-
-                // Dereference the Box to move out its value.
-                // The Box and its allocated memory are automatically freed.
-                //
-                (*boxed).unwrap()
-            }
+            // SAFETY: Completion event has fired — producer is done.
+            unsafe { result_consumer.take() }
         }
     }
 
@@ -516,11 +730,11 @@ impl Reactor {
     fn enqueue_external<F: Future<Output = ()> + 'static + Send>(
         &self,
         future: F,
-        completed_event_signaler: CooperativeWaitOneSignaler,
+        completed_event_signaler: CompletionSignaler,
     ) {
         // Single allocation: Box contains both FutureRuntimeImpl and the future inline.
         //
-        self.external_futures.push(Box::pin(FutureRuntimeImpl::new(
+        self.enqueue_external_future_runtime(Box::pin(FutureRuntimeImpl::new(
             future,
             completed_event_signaler,
         )));
@@ -532,20 +746,31 @@ impl Reactor {
         &self,
         future: F,
     ) -> impl Future<Output = ()> + 'static + Send + use<F> {
-        let (mut completed_event_wait, completed_event_signaler) =
-            match Reactor::has_local_instance() {
-                true => {
-                    let local_reactor = Reactor::local_instance();
+        let (completed_event_wait, completed_event_signaler) = match Reactor::has_local_instance() {
+            true => {
+                let local_reactor = Reactor::local_instance();
+                let (completed_event_wait, completed_event_signaler) =
+                    local_reactor.create_wait_one();
 
-                    local_reactor.create_wait_one()
-                }
-                false => CooperativeWaitOneFuture::new_no_reactor(),
-            };
+                (
+                    ExternalCompletionWaiter::Cooperative(completed_event_wait),
+                    CompletionSignaler::Cooperative(completed_event_signaler),
+                )
+            }
+            false => {
+                let completed_event = Arc::new(CountdownEvent::new(1));
+
+                (
+                    ExternalCompletionWaiter::Preemptive(completed_event.clone()),
+                    CompletionSignaler::Preemptive(completed_event),
+                )
+            }
+        };
 
         self.enqueue_external(future, completed_event_signaler);
 
         async move {
-            completed_event_wait.cooperative_wait().await;
+            completed_event_wait.wait().await;
         }
     }
 
@@ -559,32 +784,21 @@ impl Reactor {
         &self,
         future: F,
     ) -> impl Future<Output = T> + 'static + Send + use<T, F> {
-        let pinned_result_ptr_addr = Box::into_raw(Box::new(None::<T>)) as usize;
+        let result_consumer = Arc::new(ResultExternalFuture::new());
+        let result_producer = Arc::clone(&result_consumer);
 
         let local_completed_event = self.spawn_external(async move {
             let result = future.await;
 
-            unsafe {
-                let pinned_result_ptr = pinned_result_ptr_addr as *mut Option<T>;
-                *pinned_result_ptr = Some(result);
-            }
+            // SAFETY: Producer writes before signaling completion.
+            unsafe { result_producer.set(result) };
         });
 
         async move {
             local_completed_event.await;
 
-            unsafe {
-                let pinned_result_ptr = pinned_result_ptr_addr as *mut Option<T>;
-
-                // Convert raw pointer back to Box (reclaims ownership).
-                //
-                let boxed = Box::from_raw(pinned_result_ptr);
-
-                // Dereference the Box to move out its value.
-                // The Box and its allocated memory are automatically freed.
-                //
-                (*boxed).unwrap()
-            }
+            // SAFETY: Completion event has fired — producer is done.
+            unsafe { result_consumer.take() }
         }
     }
 
@@ -609,6 +823,13 @@ impl Reactor {
     pub fn set_is_in_shutdown_flag(&self, value: bool) {
         self.is_in_shutdown
             .store(value, std::sync::atomic::Ordering::Release);
+
+        // Wake a reactor blocked in wait_for_io so it re-evaluates the exit
+        // condition (same fence pairing as the external-enqueue path).
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        if self.sleeping.load(std::sync::atomic::Ordering::Relaxed) {
+            self.io_manager.wake();
+        }
     }
 
     pub fn has_local_instance() -> bool {
@@ -617,13 +838,19 @@ impl Reactor {
         !reactor_ptr.is_null()
     }
 
+    /// # Preconditions
+    /// Must be called only on threads where `set_local_instance` was executed and
+    /// before `reset_local_instance`. The TLS raw pointer must remain valid.
+    #[inline]
     pub fn local_instance<'a>() -> &'a mut Self {
         let reactor_ptr = REACTOR_INSTANCE.with(|s| unsafe { *s.get() }) as *mut Reactor;
+
+        debug_assert!(!reactor_ptr.is_null(), "Reactor TLS not initialized");
 
         unsafe { &mut *reactor_ptr }
     }
 
-    pub(crate) fn register_timeouted_io_wait_future(
+    pub(crate) fn register_timed_out_io_wait_future(
         &mut self,
         io_wait_future: *const IOWaitFuture,
         timeout: SystemTime,
@@ -632,7 +859,7 @@ impl Reactor {
             .insert(io_wait_future, io_wait_future, timeout);
     }
 
-    pub(crate) fn unregister_timeouted_io_wait_future(
+    pub(crate) fn unregister_timed_out_io_wait_future(
         &mut self,
         io_wait_future: *const IOWaitFuture,
     ) {
@@ -692,10 +919,7 @@ impl<'a> ExternalReactor<'a> {
 
     // Spawns a Future with the result from the external Reactor.
     //
-    pub fn spawn_external_with_result<
-        T: Default + 'static + Send,
-        F: Future<Output = T> + 'static + Send,
-    >(
+    pub fn spawn_external_with_result<T: 'static + Send, F: Future<Output = T> + 'static + Send>(
         &self,
         future: F,
     ) -> impl Future<Output = T> + 'static + Send + use<T, F> {
@@ -735,8 +959,8 @@ unsafe fn drop_waker(_: *const ()) {
     // Noop.
 }
 
-// Implements YieldFutre.
-// Pooling this future allows the reactor to stop executing the future, put it at the end of the active queue and execute next future in the queue.
+// Implements YieldFuture.
+// Polling this future allows the reactor to stop executing the future, put it at the end of the active queue and execute next future in the queue.
 //
 struct YieldFuture {}
 
@@ -775,4 +999,39 @@ impl Future for YieldFuture {
 #[inline]
 pub async fn cooperative_yield() {
     YieldFuture::new().await;
+}
+
+/// Helpers for unit tests that drive an `IOManager` directly, outside a
+/// running reactor.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use starfish_core::preemptive_synchronization::countdown_event::CountdownEvent;
+
+    use super::{CompletionSignaler, FutureRuntime, FutureRuntimeImpl};
+
+    /// Sets the wrapped flag when dropped, so tests can observe that a parked
+    /// task box was actually freed.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Builds a minimal `FutureRuntime` whose destruction is observable via
+    /// `dropped_flag`. The future itself never needs to be polled.
+    pub(crate) fn test_future_runtime(dropped_flag: Arc<AtomicBool>) -> FutureRuntime {
+        let guard = DropFlag(dropped_flag);
+
+        Box::pin(FutureRuntimeImpl::new(
+            async move {
+                let _guard = guard;
+            },
+            CompletionSignaler::Preemptive(Arc::new(CountdownEvent::new(1))),
+        ))
+    }
 }

@@ -2,11 +2,13 @@ use rstest::rstest;
 use starfish_core::DeferredGuard;
 use starfish_core::common_tests::sorted_collection_core_tests::*;
 use starfish_core::data_structures::SkipList;
+use starfish_core::data_structures::SkipTrie;
 use starfish_core::data_structures::SortedCollection;
 use starfish_core::data_structures::SortedList;
 
 type DeferredSortedList = SortedList<i32, DeferredGuard>;
 type DeferredSkipList = SkipList<i32, DeferredGuard>;
+type DeferredSkipTrie = SkipTrie<i32, DeferredGuard>;
 
 // ============================================================================
 // Tests that take a collection reference
@@ -15,6 +17,7 @@ type DeferredSkipList = SkipList<i32, DeferredGuard>;
 #[rstest]
 #[case::sorted_list(DeferredSortedList::default())]
 #[case::skip_list(DeferredSkipList::default())]
+#[case::skip_trie(DeferredSkipTrie::default())]
 fn test_basic<C: SortedCollection<i32>>(#[case] collection: C) {
     test_basic_operations(&collection);
 }
@@ -22,6 +25,7 @@ fn test_basic<C: SortedCollection<i32>>(#[case] collection: C) {
 #[rstest]
 #[case::sorted_list(DeferredSortedList::default())]
 #[case::skip_list(DeferredSkipList::default())]
+#[case::skip_trie(DeferredSkipTrie::default())]
 fn test_find_apply<C: SortedCollection<i32>>(#[case] collection: C) {
     test_find_and_apply(&collection);
 }
@@ -33,6 +37,7 @@ fn test_find_apply<C: SortedCollection<i32>>(#[case] collection: C) {
 #[rstest]
 #[case::sorted_list(DeferredSortedList::default())]
 #[case::skip_list(DeferredSkipList::default())]
+#[case::skip_trie(DeferredSkipTrie::default())]
 fn test_concurrent<C: SortedCollection<i32> + Default + Send + Sync + 'static>(
     #[case] _collection: C,
 ) {
@@ -42,6 +47,7 @@ fn test_concurrent<C: SortedCollection<i32> + Default + Send + Sync + 'static>(
 #[rstest]
 #[case::sorted_list(DeferredSortedList::default())]
 #[case::skip_list(DeferredSkipList::default())]
+#[case::skip_trie(DeferredSkipTrie::default())]
 fn test_concurrent_mixed<C: SortedCollection<i32> + Default + Send + Sync + 'static>(
     #[case] _collection: C,
 ) {
@@ -51,6 +57,7 @@ fn test_concurrent_mixed<C: SortedCollection<i32> + Default + Send + Sync + 'sta
 #[rstest]
 #[case::sorted_list(DeferredSortedList::default())]
 #[case::skip_list(DeferredSkipList::default())]
+#[case::skip_trie(DeferredSkipTrie::default())]
 fn test_contention<C: SortedCollection<i32> + Default + Send + Sync + 'static>(
     #[case] _collection: C,
 ) {
@@ -64,6 +71,7 @@ fn test_contention<C: SortedCollection<i32> + Default + Send + Sync + 'static>(
 #[rstest]
 #[case::sorted_list(DeferredSortedList::default())]
 #[case::skip_list(DeferredSkipList::default())]
+#[case::skip_trie(DeferredSkipTrie::default())]
 fn test_remove_value<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
     test_remove_returns_value::<C>();
 }
@@ -71,6 +79,7 @@ fn test_remove_value<C: SortedCollection<i32> + Default>(#[case] _collection: C)
 #[rstest]
 #[case::sorted_list(DeferredSortedList::default())]
 #[case::skip_list(DeferredSkipList::default())]
+#[case::skip_trie(DeferredSkipTrie::default())]
 fn test_find_ref<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
     test_find::<C>();
 }
@@ -78,6 +87,7 @@ fn test_find_ref<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
 #[rstest]
 #[case::sorted_list(DeferredSortedList::default())]
 #[case::skip_list(DeferredSkipList::default())]
+#[case::skip_trie(DeferredSkipTrie::default())]
 fn test_sequential<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
     test_sequential_operations::<C>();
 }
@@ -85,6 +95,7 @@ fn test_sequential<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
 #[rstest]
 #[case::sorted_list(DeferredSortedList::default())]
 #[case::skip_list(DeferredSkipList::default())]
+#[case::skip_trie(DeferredSkipTrie::default())]
 fn test_empty<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
     test_is_empty::<C>();
 }
@@ -96,6 +107,7 @@ fn test_empty<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
 #[rstest]
 #[case::sorted_list(DeferredSortedList::default())]
 #[case::skip_list(DeferredSkipList::default())]
+#[case::skip_trie(DeferredSkipTrie::default())]
 fn test_batch_basic<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
     test_insert_batch_basic::<C>();
 }
@@ -103,6 +115,7 @@ fn test_batch_basic<C: SortedCollection<i32> + Default>(#[case] _collection: C) 
 #[rstest]
 #[case::sorted_list(DeferredSortedList::default())]
 #[case::skip_list(DeferredSkipList::default())]
+#[case::skip_trie(DeferredSkipTrie::default())]
 fn test_batch_empty<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
     test_insert_batch_empty::<C>();
 }
@@ -110,6 +123,7 @@ fn test_batch_empty<C: SortedCollection<i32> + Default>(#[case] _collection: C) 
 #[rstest]
 #[case::sorted_list(DeferredSortedList::default())]
 #[case::skip_list(DeferredSkipList::default())]
+#[case::skip_trie(DeferredSkipTrie::default())]
 fn test_batch_with_duplicates<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
     test_insert_batch_with_duplicates::<C>();
 }
@@ -117,6 +131,7 @@ fn test_batch_with_duplicates<C: SortedCollection<i32> + Default>(#[case] _colle
 #[rstest]
 #[case::sorted_list(DeferredSortedList::default())]
 #[case::skip_list(DeferredSkipList::default())]
+#[case::skip_trie(DeferredSkipTrie::default())]
 fn test_batch_with_existing<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
     test_insert_batch_with_existing::<C>();
 }
@@ -124,6 +139,7 @@ fn test_batch_with_existing<C: SortedCollection<i32> + Default>(#[case] _collect
 #[rstest]
 #[case::sorted_list(DeferredSortedList::default())]
 #[case::skip_list(DeferredSkipList::default())]
+#[case::skip_trie(DeferredSkipTrie::default())]
 fn test_batch_from_unsorted<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
     test_insert_batch_from_unsorted::<C>();
 }
@@ -131,6 +147,7 @@ fn test_batch_from_unsorted<C: SortedCollection<i32> + Default>(#[case] _collect
 #[rstest]
 #[case::sorted_list(DeferredSortedList::default())]
 #[case::skip_list(DeferredSkipList::default())]
+#[case::skip_trie(DeferredSkipTrie::default())]
 fn test_batch_preserves_order<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
     test_insert_batch_preserves_order::<C>();
 }
@@ -138,6 +155,7 @@ fn test_batch_preserves_order<C: SortedCollection<i32> + Default>(#[case] _colle
 #[rstest]
 #[case::sorted_list(DeferredSortedList::default())]
 #[case::skip_list(DeferredSkipList::default())]
+#[case::skip_trie(DeferredSkipTrie::default())]
 fn test_batch_large<C: SortedCollection<i32> + Default>(#[case] _collection: C) {
     test_insert_batch_large::<C>();
 }
@@ -149,6 +167,7 @@ fn test_batch_large<C: SortedCollection<i32> + Default>(#[case] _collection: C) 
 #[rstest]
 #[case::sorted_list(DeferredSortedList::default())]
 #[case::skip_list(DeferredSkipList::default())]
+#[case::skip_trie(DeferredSkipTrie::default())]
 fn test_update<C: SortedCollection<i32> + Default>(#[case] collection: C) {
     test_update_operations(&collection);
 }
@@ -156,6 +175,7 @@ fn test_update<C: SortedCollection<i32> + Default>(#[case] collection: C) {
 #[rstest]
 #[case::sorted_list(DeferredSortedList::default())]
 #[case::skip_list(DeferredSkipList::default())]
+#[case::skip_trie(DeferredSkipTrie::default())]
 fn test_concurrent_update<C: SortedCollection<i32> + Default + Send + Sync + 'static>(
     #[case] _collection: C,
 ) {
@@ -165,6 +185,7 @@ fn test_concurrent_update<C: SortedCollection<i32> + Default + Send + Sync + 'st
 #[rstest]
 #[case::sorted_list(DeferredSortedList::default())]
 #[case::skip_list(DeferredSkipList::default())]
+#[case::skip_trie(DeferredSkipTrie::default())]
 fn test_len<C: SortedCollection<i32> + Default>(#[case] collection: C) {
     test_len_operations(&collection);
 }
@@ -172,6 +193,15 @@ fn test_len<C: SortedCollection<i32> + Default>(#[case] collection: C) {
 #[rstest]
 #[case::sorted_list(DeferredSortedList::default())]
 #[case::skip_list(DeferredSkipList::default())]
+#[case::skip_trie(DeferredSkipTrie::default())]
 fn test_iter<C: SortedCollection<i32> + Default>(#[case] collection: C) {
     test_iter_operations(&collection);
+}
+
+#[rstest]
+#[case::sorted_list(DeferredSortedList::default())]
+#[case::skip_list(DeferredSkipList::default())]
+#[case::skip_trie(DeferredSkipTrie::default())]
+fn test_range<C: SortedCollection<i32> + Default>(#[case] collection: C) {
+    test_range_operations(&collection);
 }

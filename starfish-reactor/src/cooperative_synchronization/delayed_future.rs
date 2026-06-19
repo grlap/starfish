@@ -1,3 +1,8 @@
+//! Cooperative sleep and delayed execution.
+//!
+//! Provides `DelayedFuture` and the `cooperative_sleep` function, allowing tasks
+//! to yield to the reactor for a specified duration without blocking the thread.
+
 use std::{
     future::Future,
     pin::Pin,

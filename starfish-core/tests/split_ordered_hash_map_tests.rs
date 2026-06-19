@@ -2,7 +2,7 @@
 mod stress_tests {
     use starfish_core::DeferredGuard;
     use starfish_core::data_structures::SplitOrderedHashMap;
-    use starfish_core::data_structures::hash::HashMapCollection;
+    use starfish_core::data_structures::hash::MapCollection;
 
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
@@ -131,8 +131,8 @@ mod stress_tests {
         }
 
         // Verify that all increments are accounted for
-        for i in 0..num_keys {
-            let expected = counters[i].load(Ordering::Relaxed);
+        for (i, counter) in counters.iter().enumerate().take(num_keys) {
+            let expected = counter.load(Ordering::Relaxed);
             let actual = map.get(&i).unwrap_or(0);
 
             // Due to race conditions, actual might be less than expected
@@ -256,11 +256,11 @@ mod stress_tests {
         }
 
         println!("Insert stress test completed");
-        for i in 0..num_keys.min(10) {
+        for (i, insert_count) in insert_counts.iter().enumerate().take(num_keys.min(10)) {
             println!(
                 "Key {}: {} successful inserts, final value: {:?}",
                 i,
-                insert_counts[i].load(Ordering::Relaxed),
+                insert_count.load(Ordering::Relaxed),
                 map.get(&i)
             );
         }
@@ -392,6 +392,66 @@ mod stress_tests {
 
         // Map size should be reasonable (not growing unbounded)
         assert!(map.len() <= 10000);
+    }
+
+    #[test]
+    fn test_stress_concurrent_update() {
+        // Hammer update on overlapping keys from many threads
+        let map: Arc<DeferredHashMap<usize, usize>> = Arc::new(SplitOrderedHashMap::new());
+        let num_threads = 32;
+        let num_keys = 200;
+        let ops_per_thread = 10_000;
+
+        // Pre-populate all keys
+        for i in 0..num_keys {
+            map.insert(i, 0);
+        }
+
+        let barrier = Arc::new(Barrier::new(num_threads));
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|t| {
+                let map = Arc::clone(&map);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    for i in 0..ops_per_thread {
+                        let key = (t * 7 + i * 13) % num_keys;
+                        match i % 5 {
+                            0 | 1 => {
+                                map.update(key, t * ops_per_thread + i);
+                            }
+                            2 => {
+                                let _ = map.get(&key);
+                            }
+                            3 => {
+                                map.remove(&key);
+                            }
+                            4 => {
+                                map.insert(key, i);
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Structural integrity: every present key has a value
+        for i in 0..num_keys {
+            if map.contains(&i) {
+                assert!(
+                    map.get(&i).is_some(),
+                    "key {} present but get returned None",
+                    i
+                );
+            }
+        }
+        assert!(map.len() <= num_keys);
     }
 
     // Add rand as dev dependency in Cargo.toml:

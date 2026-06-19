@@ -1,10 +1,14 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+//! Countdown latch for thread synchronization.
+//!
+//! Provides `CountdownEvent`, a synchronization primitive that blocks
+//! waiters until an internal counter reaches zero (similar to Java's
+//! `CountDownLatch`).
+
 use std::sync::{Condvar, Mutex};
 
 pub struct CountdownEvent {
     count: Mutex<usize>,
     condvar: Condvar,
-    notified: AtomicBool,
 }
 
 impl CountdownEvent {
@@ -14,7 +18,6 @@ impl CountdownEvent {
         CountdownEvent {
             count: Mutex::new(count),
             condvar: Condvar::new(),
-            notified: AtomicBool::new(false),
         }
     }
 
@@ -28,7 +31,6 @@ impl CountdownEvent {
         *count -= 1;
         if *count == 0 {
             self.condvar.notify_all();
-            self.notified.store(true, Ordering::Release);
             true
         } else {
             false

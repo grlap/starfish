@@ -1,3 +1,9 @@
+//! Async I/O abstractions and platform-specific backends.
+//!
+//! Re-exports cross-platform traits (`AsyncRead`, `AsyncWrite`, `IOManager`) and
+//! concrete types (`File`, `TcpListener`, `TcpStream`, `UdpSocket`), along with
+//! the platform-appropriate I/O backend (io_uring, kqueue, or IOCP).
+
 pub mod async_read;
 pub mod async_write;
 pub mod file;

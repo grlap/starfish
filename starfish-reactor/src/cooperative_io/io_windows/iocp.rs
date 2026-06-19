@@ -1,3 +1,9 @@
+//! Windows I/O Completion Port (IOCP) wrapper.
+//!
+//! Provides `IoCompletionPort`, a safe wrapper around the Win32 IOCP API for
+//! creating completion ports, associating file handles, posting completions,
+//! and dequeuing completion statuses.
+
 use std::io;
 use std::io::Error;
 use std::ptr;
@@ -45,7 +51,7 @@ impl IoCompletionPort {
         })
     }
 
-    /// Assoicates the given file handle with this IoCompletionPort.
+    /// Associates the given file handle with this IoCompletionPort.
     ///
     /// The completion key is included in every I/O completion packet for the specified file handle.
     pub fn associate(&self, handle: HANDLE, completion_key: usize) -> Result<(), io::Error> {
@@ -71,14 +77,13 @@ impl IoCompletionPort {
 
     /// Posts an I/O completion packet to the IoCompletionPort.
     ///
+    /// `PostQueuedCompletionStatus` is documented thread-safe, so this may be
+    /// called from any thread (the cross-reactor `wake()` path relies on it).
+    ///
     /// Note that the OVERLAPPED structure in the CompletionStatus does not have to be valid (it can be a null pointer).
     /// Ensure that if you intend to post an OVERLAPPED structure, it is not freed until the CompletionStatus is dequeued.
     pub fn post_queued(&self, packet: CompletionStatus) -> Result<(), io::Error> {
         self.inner.post_queued(packet)
-    }
-
-    pub fn close(&mut self) {
-        self.inner.close();
     }
 }
 
@@ -168,21 +173,29 @@ impl IocpImp {
         })
     }
 
+    /// Dequeues at most `min(buf.len(), 64)` packets per call, even when
+    /// `buf` is larger: the scratch `OVERLAPPED_ENTRY` array lives on the
+    /// stack to keep this allocation-free — the reactor calls it on every
+    /// completion poll. Leftover packets stay queued for the next call.
     pub fn get_many_queued(
         &self,
         buf: &mut [CompletionStatus],
         timeout: u32,
     ) -> Result<usize, io::Error> {
-        let n = buf.len();
+        const MAX_DEQUEUE_BATCH: usize = 64;
 
-        let mut entries: Vec<OVERLAPPED_ENTRY> = vec![OVERLAPPED_ENTRY::default(); n];
+        let batch_len = buf.len().min(MAX_DEQUEUE_BATCH);
+        let mut entries = [OVERLAPPED_ENTRY::default(); MAX_DEQUEUE_BATCH];
 
         let mut removed = 0;
 
+        // SAFETY: `self.inner` is a live completion port handle for the
+        // lifetime of this IocpImp; `entries`/`removed` are valid out-params
+        // and the slice length bounds what the kernel may write.
         unsafe {
             GetQueuedCompletionStatusEx(
                 self.inner,
-                entries.as_mut_slice(),
+                &mut entries[..batch_len],
                 &mut removed,
                 timeout,
                 false,
@@ -211,17 +224,6 @@ impl IocpImp {
         };
 
         Ok(())
-    }
-
-    pub fn close(&self) {
-        // Post an empty status to signal termination.
-        //
-        self.post_queued(CompletionStatus {
-            byte_count: 0,
-            completion_key: 0,
-            overlapped: ptr::null_mut(),
-        })
-        .unwrap();
     }
 }
 

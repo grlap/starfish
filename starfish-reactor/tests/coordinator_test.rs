@@ -1,10 +1,8 @@
 use std::{future::Future, sync::Arc, thread};
 
-use starfish_core::preemptive_synchronization::{
-    countdown_event::CountdownEvent, future_extension::FutureExtension,
-};
+use starfish_core::preemptive_synchronization::future_extension::FutureExtension;
 use starfish_reactor::coordinator::Coordinator;
-use starfish_reactor::reactor::{CooperativeReactor, Reactor, cooperative_yield};
+use starfish_reactor::reactor::{Reactor, cooperative_yield};
 
 /// Tests the basic lifecycle of a Coordinator instance:
 /// 1. Creates a new Coordinator
@@ -45,31 +43,19 @@ async fn compute_test() {
 
 #[test]
 fn test_create_coordinator2() {
-    let mut cooperative_scheduler = CooperativeReactor::new(Reactor::new());
-    cooperative_scheduler.set_is_in_shutdown_flag(false);
+    let mut coordinator = Coordinator::new();
+    _ = coordinator.initialize(2);
 
-    let cooperative_scheduler_clone = cooperative_scheduler.clone();
+    let w1 = Coordinator::reactor(0).spawn_external(compute_test());
+    let w2 = Coordinator::reactor(1).spawn_external(compute_test());
 
-    _ = cooperative_scheduler.spawn(async move {
-        // Test.
-        //
-        let mut coordinator = Coordinator::new();
-        _ = coordinator.initialize(2);
+    w1.unwrap_result();
+    w2.unwrap_result();
 
-        let w1 = Coordinator::reactor(0).spawn_external(compute_test());
-        let w2 = Coordinator::reactor(1).spawn_external(compute_test());
-
-        w1.await;
-        w2.await;
-
-        _ = coordinator.join_all();
-        cooperative_scheduler_clone.set_is_in_shutdown_flag(true);
-    });
-
-    cooperative_scheduler.run();
+    _ = coordinator.join_all();
 }
 
-async fn execute_async(countdown_event: Arc<CountdownEvent>) {
+async fn execute_async() {
     let a = Coordinator::reactor(1).spawn_external(compute_test());
     let b = Coordinator::reactor(2).spawn_external(compute_test());
     let c = Coordinator::reactor(3).spawn_external(compute_test());
@@ -78,28 +64,20 @@ async fn execute_async(countdown_event: Arc<CountdownEvent>) {
     a.await;
     b.await;
     c.await;
-
-    countdown_event.signal();
 }
 
 #[test]
 fn test_execute_async() {
-    let countdown_event = Arc::new(CountdownEvent::new(1));
-
     // Test.
     //
     let mut coordinator = Coordinator::new();
     _ = coordinator.initialize(4);
 
-    // #TODO, implement without countdown_event
-    //
-    let wait = Coordinator::reactor(0).spawn_external(execute_async(countdown_event.clone()));
-
-    countdown_event.wait();
-
-    _ = coordinator.join_all();
+    let wait = Coordinator::reactor(0).spawn_external(execute_async());
 
     wait.unwrap_result();
+
+    _ = coordinator.join_all();
 }
 
 #[test]

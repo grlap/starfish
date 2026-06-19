@@ -1,0 +1,18 @@
+[package]
+name = "starfish-quic"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# ring is used directly in packet/retry.rs for AES-128-GCM (Retry Integrity Tag)
+# and HMAC-SHA256 (stateless Retry tokens). Keep version aligned with rustls's ring dep.
+ring = "0.17"
+rustls = { version = "0.23.31", features = ["ring"] }
+starfish-reactor = { version = "0.1.0", path = "../starfish-reactor" }
+rand = "0.9.2"
+
+[dev-dependencies]
+rcgen = "0.13.2"
+rustls-pemfile = "2.2.0"
+starfish-core = { version = "0.1.0", path = "../starfish-core" }
+webpki-roots = "0.26.8"

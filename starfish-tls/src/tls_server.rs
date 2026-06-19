@@ -1,16 +1,27 @@
+//! TLS server implementation for async streams.
+//!
+//! Provides `TlsServer<S>`, a wrapper that adds server-side TLS encryption
+//! to any stream implementing `AsyncRead + AsyncWrite`. Performs automatic
+//! handshake on construction and implements async read/write with timeout support.
+
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
-use rustls::{ServerConfig, ServerConnection};
+use rustls::pki_types::CertificateDer;
+use rustls::{ProtocolVersion, ServerConfig, ServerConnection, SupportedCipherSuite};
 use starfish_reactor::cooperative_io::async_read::AsyncRead;
 use starfish_reactor::cooperative_io::async_write::AsyncWrite;
 use starfish_reactor::cooperative_io::async_write::AsyncWriteExtension;
 use starfish_reactor::cooperative_io::io_timeout::IOTimeout;
 
+use crate::error::TlsError;
+
 /// TLS server that wraps an async stream
 pub struct TlsServer<S> {
     connection: ServerConnection,
     stream: S,
+    read_buf: Vec<u8>,
+    write_buf: Vec<u8>,
 }
 
 impl<S> TlsServer<S>
@@ -18,12 +29,17 @@ where
     S: AsyncRead + AsyncWrite,
 {
     /// Create a new TLS server with the provided certificate and private key
-    pub async fn new(stream: S, config: ServerConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new(stream: S, config: ServerConfig) -> Result<Self, TlsError> {
         // Create server connection
         let connection = ServerConnection::new(Arc::new(config))?;
 
         // Create server
-        let mut server = Self { connection, stream };
+        let mut server = Self {
+            connection,
+            stream,
+            read_buf: Vec::new(),
+            write_buf: Vec::new(),
+        };
 
         // Perform TLS handshake
         server.handshake_with_timeout(&None).await?;
@@ -68,9 +84,42 @@ where
                     .read_tls(&mut &buffer[..count])
                     .map_err(io::Error::other)?;
             } else {
+                // Flush any remaining handshake data that was generated
+                // by process_new_packets but not yet written.
+                let mut buffer = Vec::new();
+                let wrote = self
+                    .connection
+                    .write_tls(&mut buffer)
+                    .map_err(io::Error::other)?;
+                if wrote > 0 {
+                    self.stream.write_all_with_timeout(&buffer, timeout).await?;
+                    self.stream.flush_with_timeout(timeout).await?;
+                }
                 return Ok(());
             }
         }
+    }
+}
+
+impl<S> TlsServer<S> {
+    /// Returns the negotiated TLS protocol version, if the handshake has completed.
+    pub fn protocol_version(&self) -> Option<ProtocolVersion> {
+        self.connection.protocol_version()
+    }
+
+    /// Returns the negotiated cipher suite, if the handshake has completed.
+    pub fn negotiated_cipher_suite(&self) -> Option<SupportedCipherSuite> {
+        self.connection.negotiated_cipher_suite()
+    }
+
+    /// Returns the peer's certificate chain, if available.
+    pub fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]> {
+        self.connection.peer_certificates()
+    }
+
+    /// Returns the negotiated ALPN protocol, if any.
+    pub fn alpn_protocol(&self) -> Option<&[u8]> {
+        self.connection.alpn_protocol()
     }
 }
 
@@ -84,74 +133,92 @@ where
         buf: &mut [u8],
         timeout: &Option<IOTimeout>,
     ) -> io::Result<usize> {
+        let mut buf_len = 0;
+
+        self.read_buf
+            .resize(buf.len().max(crate::MIN_READ_BUF_SIZE), 0);
+
+        // Main read loop.
+        //
         loop {
-            // First try reading from already decrypted data
-            match self.connection.reader().read(buf) {
-                Ok(count) => {
-                    // Successfully read some data (or got 0 with empty buffer)
-                    if count > 0 || buf.is_empty() {
-                        return Ok(count);
+            // Drain any decrypted plaintext before touching the socket again.
+            // Rustls can still report `wants_read()` even when application bytes
+            // are already available, so gating this on `wants_read()` can hang
+            // keep-alive protocols waiting for data that is already decrypted.
+            if !self.connection.is_handshaking() {
+                match self.connection.reader().read(&mut buf[buf_len..]) {
+                    Ok(count) if count > 0 => {
+                        buf_len += count;
+                    }
+                    _ => {}
+                }
+            }
+
+            if buf_len > 0 {
+                return Ok(buf_len);
+            }
+
+            // Read encrypted data from the underlying stream.
+            //
+            let count = match self
+                .stream
+                .read_with_timeout(&mut self.read_buf, timeout)
+                .await
+            {
+                Ok(0) => {
+                    if self.connection.is_handshaking() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "EOF during handshake",
+                        ));
                     }
 
-                    // Got 0 bytes with non-empty buffer, need more data
+                    // Stream EOF — drain any remaining plaintext.
+                    //
+                    let _ = self.connection.process_new_packets();
+                    match self.connection.reader().read(&mut buf[buf_len..]) {
+                        Ok(n) if n > 0 => return Ok(buf_len + n),
+                        _ => return Ok(buf_len),
+                    }
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    // Need more data, continue to read from stream.
+                Ok(count) => count,
+                Err(e) => return Err(e),
+            };
+
+            // Feed received data to the TLS connection, looping in case
+            // read_tls cannot consume everything at once.
+            //
+            let mut offset = 0;
+            while offset < count {
+                let n = self
+                    .connection
+                    .read_tls(&mut &self.read_buf[offset..count])
+                    .map_err(io::Error::other)?;
+                if n == 0 {
+                    break;
                 }
-                Err(e) => {
-                    // Other error, propagate it
-                    return Err(io::Error::other(e));
+                offset += n;
+
+                // Process after each feed to free internal buffer space.
+                //
+                match self.connection.process_new_packets() {
+                    Ok(io_state) => {
+                        if io_state.plaintext_bytes_to_read() > 0 {
+                            match self.connection.reader().read(&mut buf[buf_len..]) {
+                                Ok(c) => {
+                                    buf_len += c;
+                                }
+                                Err(err) => {
+                                    return Err(io::Error::other(err));
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        return Err(io::Error::other(err));
+                    }
                 }
             }
-
-            // Need more data from the TCP stream
-            // Check if connection is closed AND no more buffered data
-            if !self.connection.wants_read() && !self.connection.is_handshaking() {
-                // Check for any pending data after closing
-                match self.connection.reader().read(buf) {
-                    Ok(0) => return Ok(0),  // Truly done
-                    Ok(n) => return Ok(n),  // Some final data
-                    Err(_) => return Ok(0), // No more data
-                }
-            }
-
-            // Read more encrypted data from the underlying stream
-            let mut tls_buffer = [0u8; 8192]; // Larger buffer
-            let count = self
-                .stream
-                .read_with_timeout(&mut tls_buffer, timeout)
-                .await?;
-
-            if count == 0 {
-                // EOF on underlying stream
-                if self.connection.is_handshaking() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "EOF during handshake",
-                    ));
-                }
-
-                // Process any final packets (errors expected during connection close)
-                let _ = self.connection.process_new_packets();
-
-                // Try one more read for any buffered data
-                match self.connection.reader().read(buf) {
-                    Ok(n) => return Ok(n),
-                    Err(_) => return Ok(0),
-                }
-            }
-
-            // Feed received data to TLS connection
-            self.connection
-                .read_tls(&mut &tls_buffer[..count])
-                .map_err(io::Error::other)?;
-
-            // Process the new TLS data
-            if let Err(e) = self.connection.process_new_packets() {
-                return Err(io::Error::other(e));
-            }
-
-            // Try reading again after processing new data
         }
     }
 }
@@ -186,14 +253,13 @@ where
             .map_err(io::Error::other)?;
 
         // Write any pending TLS data to the underlying stream
-        let mut buffer = Vec::new();
         loop {
-            buffer.clear(); // Reuse allocation
+            self.write_buf.clear();
 
             // Use write_tls with our buffer as the writer
             let wrote = self
                 .connection
-                .write_tls(&mut buffer)
+                .write_tls(&mut self.write_buf)
                 .map_err(io::Error::other)?;
 
             // If no data was written, we're done
@@ -202,7 +268,9 @@ where
             }
 
             // Write the buffered data to the underlying stream
-            self.stream.write_all_with_timeout(&buffer, timeout).await?;
+            self.stream
+                .write_all_with_timeout(&self.write_buf, timeout)
+                .await?;
         }
 
         // Flush the underlying stream

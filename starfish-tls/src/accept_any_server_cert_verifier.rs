@@ -1,3 +1,9 @@
+//! Certificate verifier that accepts any server certificate (**testing only**).
+//!
+//! Provides `AcceptAnyServerCertVerifier`, which disables all certificate
+//! validation. This makes TLS connections vulnerable to MITM attacks and
+//! must never be used in production.
+
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::aws_lc_rs::default_provider;
 

@@ -1,7 +1,7 @@
 //! Hash-based collection implementations.
 
-pub mod hash_map_collection;
+pub mod map_collection;
 pub mod split_ordered_hash_map;
 
-pub use hash_map_collection::{HashMapCollection, HashMapNode};
+pub use map_collection::{MapCollection, MapCollectionInternal, MapNode};
 pub use split_ordered_hash_map::SplitOrderedHashMap;

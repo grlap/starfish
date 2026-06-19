@@ -1,3 +1,9 @@
+//! Future type for awaiting kqueue I/O readiness.
+//!
+//! Provides `IOWaitFuture` and `IOCallbackWrapper` for kqueue-based async I/O.
+//! The future yields to the reactor until kqueue signals readiness, then invokes
+//! the wrapped callback to perform the actual I/O operation.
+
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -48,7 +54,7 @@ impl IOWaitFuture {
             buffer_offset: 0,
             should_continue,
             io_result: None,
-            timeout: *timeout,
+            timeout: timeout.map(IOTimeout::normalize),
             io_callback: Box::new(io_callback.callback),
         }
     }

@@ -67,6 +67,30 @@ impl TestLock for CooperativeReactorAwareLock<usize> {
 }
 
 // =============================================================================
+// Send/Sync compile-time assertions
+// =============================================================================
+
+/// Verifies that lock types with Send payloads are Send + Sync.
+/// This is a compile-time regression test for Bug 21 (unsound Send/Sync impls).
+#[test]
+fn lock_with_send_payload_is_send_sync() {
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+
+    assert_send::<CooperativeFairLock<usize>>();
+    assert_sync::<CooperativeFairLock<usize>>();
+    assert_send::<CooperativeUnfairLock<usize>>();
+    assert_sync::<CooperativeUnfairLock<usize>>();
+    assert_send::<CooperativeReactorAwareLock<usize>>();
+    assert_sync::<CooperativeReactorAwareLock<usize>>();
+}
+
+// NOTE: Negative test (non-Send payload must NOT be Send/Sync) cannot be
+// expressed as a #[test] without trybuild. The bounds are enforced by:
+//   unsafe impl<T: ?Sized + Send> Send for FairLock<T> {}
+// Attempting `CooperativeFairLock<Rc<()>>` will fail to compile.
+
+// =============================================================================
 // try_acquire Tests (FairLock only - other locks have same behavior)
 // =============================================================================
 

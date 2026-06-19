@@ -1,3 +1,8 @@
+//! Cooperative async TCP stream.
+//!
+//! Provides `TcpStream` with `AsyncRead` and `AsyncWrite` implementations for
+//! non-blocking TCP communication within the reactor's cooperative scheduler.
+
 use std::{
     future::Future,
     io,

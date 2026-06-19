@@ -1,3 +1,8 @@
+//! Linux I/O backend using io_uring.
+//!
+//! Re-exports `UringIOManager` as `DefaultIOManager` and provides modules for
+//! io_uring-based file and network operations.
+
 use uring_io_manager::{UringIOManager, UringIOManagerCreateOptions};
 
 pub mod io_file;

@@ -28,7 +28,8 @@ fn single_reactor_benchmark(c: &mut Criterion) {
     // FairLock: Single task, no contention.
     group.bench_function("fair_lock_no_contention_1000", |b| {
         b.iter(|| {
-            let mut reactor = Reactor::new();
+            let mut reactor =
+                Reactor::try_new_with_io_manager(NoopIOManagerCreateOptions::new()).unwrap();
             let lock = CooperativeFairLock::new(0usize);
 
             let lock_clone = lock.clone();
@@ -47,7 +48,8 @@ fn single_reactor_benchmark(c: &mut Criterion) {
     // UnfairLock: Single task, no contention.
     group.bench_function("unfair_lock_no_contention_1000", |b| {
         b.iter(|| {
-            let mut reactor = Reactor::new();
+            let mut reactor =
+                Reactor::try_new_with_io_manager(NoopIOManagerCreateOptions::new()).unwrap();
             let lock = CooperativeUnfairLock::new(0usize);
 
             let lock_clone = lock.clone();
@@ -66,7 +68,8 @@ fn single_reactor_benchmark(c: &mut Criterion) {
     // ReactorAwareLock: Single task, no contention.
     group.bench_function("reactor_aware_lock_no_contention_1000", |b| {
         b.iter(|| {
-            let mut reactor = Reactor::new();
+            let mut reactor =
+                Reactor::try_new_with_io_manager(NoopIOManagerCreateOptions::new()).unwrap();
             let lock = CooperativeReactorAwareLock::new(0usize);
 
             let lock_clone = lock.clone();
@@ -85,7 +88,8 @@ fn single_reactor_benchmark(c: &mut Criterion) {
     // FairLock: Two tasks contending.
     group.bench_function("fair_lock_2_tasks_contention_1000", |b| {
         b.iter(|| {
-            let mut reactor = Reactor::new();
+            let mut reactor =
+                Reactor::try_new_with_io_manager(NoopIOManagerCreateOptions::new()).unwrap();
             let lock = CooperativeFairLock::new(0usize);
 
             for _ in 0..2 {
@@ -108,7 +112,8 @@ fn single_reactor_benchmark(c: &mut Criterion) {
     // UnfairLock: Two tasks contending.
     group.bench_function("unfair_lock_2_tasks_contention_1000", |b| {
         b.iter(|| {
-            let mut reactor = Reactor::new();
+            let mut reactor =
+                Reactor::try_new_with_io_manager(NoopIOManagerCreateOptions::new()).unwrap();
             let lock = CooperativeUnfairLock::new(0usize);
 
             for _ in 0..2 {
@@ -131,7 +136,8 @@ fn single_reactor_benchmark(c: &mut Criterion) {
     // ReactorAwareLock: Two tasks contending.
     group.bench_function("reactor_aware_lock_2_tasks_contention_1000", |b| {
         b.iter(|| {
-            let mut reactor = Reactor::new();
+            let mut reactor =
+                Reactor::try_new_with_io_manager(NoopIOManagerCreateOptions::new()).unwrap();
             let lock = CooperativeReactorAwareLock::new(0usize);
 
             for _ in 0..2 {
@@ -154,7 +160,8 @@ fn single_reactor_benchmark(c: &mut Criterion) {
     // FairLock: Many tasks (high contention).
     group.bench_function("fair_lock_10_tasks_contention_1000", |b| {
         b.iter(|| {
-            let mut reactor = Reactor::new();
+            let mut reactor =
+                Reactor::try_new_with_io_manager(NoopIOManagerCreateOptions::new()).unwrap();
             let lock = CooperativeFairLock::new(0usize);
 
             for _ in 0..10 {
@@ -177,7 +184,8 @@ fn single_reactor_benchmark(c: &mut Criterion) {
     // UnfairLock: Many tasks (high contention).
     group.bench_function("unfair_lock_10_tasks_contention_1000", |b| {
         b.iter(|| {
-            let mut reactor = Reactor::new();
+            let mut reactor =
+                Reactor::try_new_with_io_manager(NoopIOManagerCreateOptions::new()).unwrap();
             let lock = CooperativeUnfairLock::new(0usize);
 
             for _ in 0..10 {
@@ -200,7 +208,8 @@ fn single_reactor_benchmark(c: &mut Criterion) {
     // ReactorAwareLock: Many tasks (high contention).
     group.bench_function("reactor_aware_lock_10_tasks_contention_1000", |b| {
         b.iter(|| {
-            let mut reactor = Reactor::new();
+            let mut reactor =
+                Reactor::try_new_with_io_manager(NoopIOManagerCreateOptions::new()).unwrap();
             let lock = CooperativeReactorAwareLock::new(0usize);
 
             for _ in 0..10 {
@@ -511,7 +520,8 @@ fn baseline_benchmark(c: &mut Criterion) {
     // std::sync::Mutex: Inside async reactor context (fair comparison with cooperative locks).
     group.bench_function("std_mutex_in_reactor_no_contention_1000", |b| {
         b.iter(|| {
-            let mut reactor = Reactor::new();
+            let mut reactor =
+                Reactor::try_new_with_io_manager(NoopIOManagerCreateOptions::new()).unwrap();
             let mutex = Arc::new(Mutex::new(0usize));
 
             let mutex_clone = mutex.clone();

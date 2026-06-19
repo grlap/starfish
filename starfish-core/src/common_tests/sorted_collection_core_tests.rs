@@ -1,3 +1,8 @@
+//! Core correctness tests for `SortedCollection` implementations.
+//!
+//! Tests basic operations (insert, find, delete, update), edge cases,
+//! and concurrent access patterns. Generic over any `SortedCollection<i32>`.
+
 use std::sync::Arc;
 use std::thread;
 
@@ -500,12 +505,94 @@ where
 {
     use crate::data_structures::SortedCollectionIter;
 
-    collection.insert(10);
-    collection.insert(5);
-    collection.insert(15);
+    for i in [10, 20, 30, 40, 50] {
+        collection.insert(i);
+    }
 
-    // Test basic iteration
+    // Test basic iteration (zero-copy via Deref)
     let iter = SortedCollectionIter::new(collection);
-    let items: Vec<_> = iter.collect();
-    assert_eq!(items, vec![5, 10, 15]);
+    let items: Vec<_> = iter.map(|item| *item).collect();
+    assert_eq!(items, vec![10, 20, 30, 40, 50]);
+
+    let mut iter = SortedCollectionIter::new(collection);
+    assert_eq!(iter.next().map(|item| *item), Some(10));
+    iter.repin();
+    let tail: Vec<_> = iter.map(|item| *item).collect();
+    assert_eq!(tail, vec![20, 30, 40, 50]);
+
+    // Test selective cloning (only even multiples of 20)
+    let filtered: Vec<i32> = collection
+        .iter()
+        .filter(|item| **item % 20 == 0)
+        .map(|item| *item)
+        .collect();
+    assert_eq!(filtered, vec![20, 40]);
+
+    // Test zero-copy sum
+    let sum: i32 = collection.iter().map(|item| *item).sum();
+    assert_eq!(sum, 150);
+
+    // Test to_vec convenience
+    let all_values = collection.to_vec();
+    assert_eq!(all_values, vec![10, 20, 30, 40, 50]);
+}
+
+/// Test range query operations
+pub fn test_range_operations<C>(collection: &C)
+where
+    C: SortedCollection<i32> + Default,
+{
+    // Insert 0..100
+    for i in 0..100 {
+        collection.insert(i);
+    }
+
+    // Test 1: Standard range (inclusive..exclusive)
+    let values: Vec<i32> = collection.range(10..20).map(|x| *x).collect();
+    assert_eq!(values, (10..20).collect::<Vec<_>>());
+
+    // Test 2: Inclusive range
+    let values: Vec<i32> = collection.range(10..=20).map(|x| *x).collect();
+    assert_eq!(values, (10..=20).collect::<Vec<_>>());
+
+    // Test 3: Open-ended from
+    let values: Vec<i32> = collection.range(90..).map(|x| *x).collect();
+    assert_eq!(values, (90..100).collect::<Vec<_>>());
+
+    // Test 4: Open-ended to
+    let values: Vec<i32> = collection.range(..10).map(|x| *x).collect();
+    assert_eq!(values, (0..10).collect::<Vec<_>>());
+
+    // Test 5: Inclusive to
+    let values: Vec<i32> = collection.range(..=10).map(|x| *x).collect();
+    assert_eq!(values, (0..=10).collect::<Vec<_>>());
+
+    // Test 6: Full range
+    let count = collection.range(..).count();
+    assert_eq!(count, 100);
+
+    // Test 7: Empty range
+    let values: Vec<i32> = collection.range(50..50).map(|x| *x).collect();
+    assert_eq!(values, Vec::<i32>::new());
+
+    // Test 8: Zero-copy access with sum
+    let sum: i32 = collection.range(20..30).map(|x| *x).sum();
+    assert_eq!(sum, (20..30).sum::<i32>());
+
+    // Test 9: Range starting at non-existent key
+    collection.delete(&15);
+    collection.delete(&16);
+    collection.delete(&17);
+    let values: Vec<i32> = collection.range(15..20).map(|x| *x).collect();
+    assert_eq!(values, vec![18, 19]);
+
+    // Test 10: Range beyond collection bounds
+    let values: Vec<i32> = collection.range(95..200).map(|x| *x).collect();
+    assert_eq!(values, (95..100).collect::<Vec<_>>());
+
+    let mut range = collection.range(30..35);
+    assert_eq!(range.next().map(|item| *item), Some(30));
+    range.repin();
+    let tail: Vec<_> = range.map(|item| *item).collect();
+    assert_eq!(tail, vec![31, 32, 33, 34]);
 }

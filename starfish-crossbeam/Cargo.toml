@@ -5,14 +5,17 @@ edition = "2024"
 
 [dependencies]
 crossbeam-epoch = "0.9.18"
+crossbeam-skiplist = "0.1"
+fastrand = "2"
 mimalloc = { version = "0.1.48", features = ["v3"] }
-starfish-core = { version = "0.1.0", path = "../starfish-core", features = ["sorted_collection_core_tests"] }
-starfish-storage = { version = "0.1.0", path = "../starfish-storage" }
+starfish-core = { version = "0.1.0", path = "../starfish-core" }
 
 [dev-dependencies]
 criterion = "0.5"
-crossbeam-skiplist = "0.1"
+starfish-core = { version = "0.1.0", path = "../starfish-core", features = ["sorted_collection_core_tests", "bench_utils"] }
+rand = "0.8"
 rstest = "0.18"
+scc = "2.2"
 serial_test = "3.0"
 
 [[bench]]
@@ -22,3 +25,19 @@ harness = false
 [[bench]]
 name = "hash_map_benchmark"
 harness = false
+
+[[bench]]
+name = "indexset_concurrent"
+harness = false
+
+[[bench]]
+name = "upsert_operations"
+harness = false
+
+[[bench]]
+name = "y_fast_trie_benchmark"
+harness = false
+
+[[bin]]
+name = "profile_skiplist"
+path = "src/bin/profile_skiplist.rs"

@@ -1,3 +1,9 @@
+//! One-shot cooperative wait/signal future.
+//!
+//! Provides `CooperativeWaitOneFuture` for a single producer-consumer synchronization
+//! pattern where one task signals completion and exactly one waiting task is woken.
+//! Safe for cross-reactor (cross-thread) signaling via atomic state.
+
 use std::cell::UnsafeCell;
 use std::future::Future;
 use std::pin::Pin;
@@ -42,15 +48,7 @@ impl WaitOneSharedState {
         }
     }
 
-    pub(super) fn new_no_reactor() -> Self {
-        WaitOneSharedState {
-            reactor_ptr: ptr::null_mut(),
-            waiting_future: UnsafeCell::new(None),
-            is_signaled: AtomicBool::new(false),
-        }
-    }
-
-    pub(crate) fn set_waiting(&mut self, waiting_future: FutureRuntime) {
+    pub(crate) fn set_waiting(&self, waiting_future: FutureRuntime) {
         // Store the future BEFORE the swap so signal() can see it.
         //
         unsafe {
@@ -67,12 +65,13 @@ impl WaitOneSharedState {
             //
             let future_runtime = unsafe { (*self.waiting_future.get()).take().unwrap() };
 
-            match self.assigned_reactor() {
-                Some(reactor) => {
-                    reactor.enqueue_external_feature_runtime(future_runtime);
-                }
-                None => todo!(),
-            }
+            // SAFETY: CooperativeWaitOneFuture always has an assigned reactor
+            // (new_no_reactor was removed; construction requires a &Reactor).
+            //
+            let reactor = self
+                .assigned_reactor()
+                .expect("CooperativeWaitOneFuture requires an assigned reactor");
+            reactor.enqueue_external_future_runtime(future_runtime);
         }
     }
 
@@ -87,12 +86,12 @@ impl WaitOneSharedState {
             //
             let future_runtime = unsafe { (*self.waiting_future.get()).take().unwrap() };
 
-            match self.assigned_reactor() {
-                Some(reactor) => {
-                    reactor.enqueue_external_feature_runtime(future_runtime);
-                }
-                None => todo!(),
-            }
+            // SAFETY: CooperativeWaitOneFuture always has an assigned reactor.
+            //
+            let reactor = self
+                .assigned_reactor()
+                .expect("CooperativeWaitOneFuture requires an assigned reactor");
+            reactor.enqueue_external_future_runtime(future_runtime);
         }
         // If was_signaled was false, set_waiting() hasn't run yet.
         // When it does run, it will see is_signaled=true and enqueue directly.
@@ -165,20 +164,7 @@ impl CooperativeWaitOneFuture {
         )
     }
 
-    pub(crate) fn new_no_reactor() -> (Self, CooperativeWaitOneSignaler) {
-        let wait_one_shared_state = ArcPointer::new(WaitOneSharedState::new_no_reactor());
-
-        (
-            CooperativeWaitOneFuture {
-                state: wait_one_shared_state.clone(),
-            },
-            CooperativeWaitOneSignaler {
-                state: wait_one_shared_state,
-            },
-        )
-    }
-
-    pub(crate) fn set_waiting(&mut self, waiting_future: FutureRuntime) {
+    pub(crate) fn set_waiting(&self, waiting_future: FutureRuntime) {
         self.state.set_waiting(waiting_future);
     }
 

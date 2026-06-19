@@ -180,6 +180,7 @@ mod tests {
         assert!(cleared.is_deleted());
         assert!(!cleared.is_del_next());
 
+        // SAFETY: `ptr` was created by `Box::into_raw` above and is not used after this.
         unsafe {
             drop(Box::from_raw(ptr));
         }
@@ -194,6 +195,7 @@ mod tests {
         let clean = MarkedPtr3Bit::unmask(marked);
         assert_eq!(clean, ptr);
 
+        // SAFETY: `ptr` was created by `Box::into_raw` above and is not used after this.
         unsafe {
             drop(Box::from_raw(ptr));
         }

@@ -4,3 +4,10 @@ Cargo.lock
 .vs
 .vscode
 
+# Stray compiled binaries
+lifetime_named
+1.txt
+
+
+# Async file I/O test artifacts (io_file_test.rs)
+buffer.temp*

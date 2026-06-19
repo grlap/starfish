@@ -18,7 +18,7 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use starfish_core::{SortedList, SortedCollection};
+//! use starfish_core::data_structures::{SortedList, SortedCollection};
 //! use starfish_crossbeam::EpochGuard;
 //!
 //! let list: SortedList<i32, EpochGuard> = SortedList::new();
@@ -154,6 +154,10 @@ impl Guard for EpochGuard {
         epoch::pin()
     }
 
+    fn repin(guard: &mut Self::ReadGuard) {
+        guard.repin();
+    }
+
     unsafe fn defer_destroy<N>(&self, node: *mut N, dealloc: unsafe fn(*mut N)) {
         // Pin the current thread, schedule destruction, then unpin
         // The destruction will happen after all threads have advanced past
@@ -237,5 +241,11 @@ mod tests {
             guard.defer_destroy(ptr1, |p| drop(Box::from_raw(p)));
             guard.defer_destroy(ptr2, |p| drop(Box::from_raw(p)));
         }
+    }
+
+    #[test]
+    fn test_epoch_guard_repin() {
+        let mut guard = EpochGuard::pin();
+        EpochGuard::repin(&mut guard);
     }
 }

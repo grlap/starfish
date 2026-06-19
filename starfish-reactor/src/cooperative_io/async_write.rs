@@ -1,3 +1,8 @@
+//! Asynchronous write trait and extension methods.
+//!
+//! Defines `AsyncWrite` for cooperative non-blocking writes with optional timeouts,
+//! and `AsyncWriteExtension` providing convenience methods like `write_all`.
+
 use std::future::Future;
 use std::io;
 

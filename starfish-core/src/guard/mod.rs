@@ -83,6 +83,12 @@ pub trait Guard: Sized + Default + Send + Sync {
     ///
     fn pin() -> Self::ReadGuard;
 
+    /// Re-observe the current reclamation state while keeping the read guard active.
+    ///
+    /// Implementations may advance the underlying epoch, reclaim stale garbage,
+    /// or simply no-op if the strategy does not require repinning.
+    fn repin(guard: &mut Self::ReadGuard);
+
     /// Schedule a node for deferred destruction.
     ///
     /// The node will be deallocated when it's safe (no readers).

@@ -1,59 +1,62 @@
+//! Lock-free hash map using split-ordered lists.
+//!
+//! Implements a concurrent hash map that embeds sentinel and regular nodes
+//! into a single sorted list, partitioned by bit-reversed hash keys.
+//! Grows dynamically by doubling bucket count when load exceeds threshold.
+
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use crate::data_structures::hash::{HashMapCollection, HashMapNode};
+use crate::data_structures::hash::{MapCollection, MapCollectionInternal, MapNode};
 use crate::data_structures::sorted::sorted_list::{ListNodePosition, SortedList, SortedListNode};
-use crate::data_structures::{CollectionNode, MarkedPtr, NodePosition, SortedCollection};
+use crate::data_structures::{
+    CollectionNode, MarkedPtr, NodePosition, SortedCollection, SortedCollectionInternal,
+};
 use crate::guard::Guard;
 
 const INITIAL_BUCKETS: usize = 16;
 const MAX_LOAD: usize = 4;
 
-/// A unified entry type for the split-ordered list
-/// Combines sentinels and regular entries in a single type
+/// A unified entry type for the split-ordered list.
+/// Combines sentinels and regular entries in a single type.
+///
+/// `split_key` is a direct field so the hot-path comparison (by split_key)
+/// avoids enum matching entirely.
 #[derive(Clone)]
-pub enum SplitOrderedEntry<K, V> {
+pub struct SplitOrderedEntry<K, V> {
+    split_key: usize,
+    kind: EntryKind<K, V>,
+}
+
+#[derive(Clone)]
+enum EntryKind<K, V> {
     Sentinel {
-        split_key: usize, // Bit-reversed bucket index
         bucket: usize,
     },
     Regular {
-        split_key: usize, // Bit-reversed hash
-        hash: usize,      // Original hash
+        hash: usize,
         key: K,
-        value: Option<V>, // None for search, Some(v) for actual entries
+        value: Option<V>,
     },
 }
 
 impl<K: Eq, V> PartialEq for SplitOrderedEntry<K, V> {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
+        if self.split_key != other.split_key {
+            return false;
+        }
+        match (&self.kind, &other.kind) {
+            (EntryKind::Sentinel { bucket: b1 }, EntryKind::Sentinel { bucket: b2 }) => b1 == b2,
             (
-                SplitOrderedEntry::Sentinel {
-                    split_key: s1,
-                    bucket: b1,
+                EntryKind::Regular {
+                    hash: h1, key: k1, ..
                 },
-                SplitOrderedEntry::Sentinel {
-                    split_key: s2,
-                    bucket: b2,
+                EntryKind::Regular {
+                    hash: h2, key: k2, ..
                 },
-            ) => s1 == s2 && b1 == b2,
-            (
-                SplitOrderedEntry::Regular {
-                    split_key: s1,
-                    hash: h1,
-                    key: k1,
-                    ..
-                },
-                SplitOrderedEntry::Regular {
-                    split_key: s2,
-                    hash: h2,
-                    key: k2,
-                    ..
-                },
-            ) => s1 == s2 && h1 == h2 && k1 == k2,
+            ) => h1 == h2 && k1 == k2,
             _ => false,
         }
     }
@@ -68,45 +71,30 @@ impl<K: Eq + Ord, V> PartialOrd for SplitOrderedEntry<K, V> {
 }
 
 impl<K: Eq + Ord, V> Ord for SplitOrderedEntry<K, V> {
+    #[inline]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Extract split keys for primary comparison
-        let self_split = match self {
-            SplitOrderedEntry::Sentinel { split_key, .. } => *split_key,
-            SplitOrderedEntry::Regular { split_key, .. } => *split_key,
-        };
-
-        let other_split = match other {
-            SplitOrderedEntry::Sentinel { split_key, .. } => *split_key,
-            SplitOrderedEntry::Regular { split_key, .. } => *split_key,
-        };
-
-        // Primary ordering by split_key
-        match self_split.cmp(&other_split) {
+        // Hot path: split_key comparison without enum matching
+        match self.split_key.cmp(&other.split_key) {
             std::cmp::Ordering::Equal => {
-                // For same split_key, sentinels come first, then regular entries
-                match (self, other) {
-                    (SplitOrderedEntry::Sentinel { .. }, SplitOrderedEntry::Regular { .. }) => {
+                // Sentinels before regular entries; then by hash, then by key
+                match (&self.kind, &other.kind) {
+                    (EntryKind::Sentinel { .. }, EntryKind::Regular { .. }) => {
                         std::cmp::Ordering::Less
                     }
-                    (SplitOrderedEntry::Regular { .. }, SplitOrderedEntry::Sentinel { .. }) => {
+                    (EntryKind::Regular { .. }, EntryKind::Sentinel { .. }) => {
                         std::cmp::Ordering::Greater
                     }
+                    (EntryKind::Sentinel { bucket: b1 }, EntryKind::Sentinel { bucket: b2 }) => {
+                        b1.cmp(b2)
+                    }
                     (
-                        SplitOrderedEntry::Sentinel { bucket: b1, .. },
-                        SplitOrderedEntry::Sentinel { bucket: b2, .. },
-                    ) => b1.cmp(b2),
-                    // For regular entries, compare by hash then key
-                    (
-                        SplitOrderedEntry::Regular {
+                        EntryKind::Regular {
                             hash: h1, key: k1, ..
                         },
-                        SplitOrderedEntry::Regular {
+                        EntryKind::Regular {
                             hash: h2, key: k2, ..
                         },
-                    ) => match h1.cmp(h2) {
-                        std::cmp::Ordering::Equal => k1.cmp(k2),
-                        ord => ord,
-                    },
+                    ) => h1.cmp(h2).then_with(|| k1.cmp(k2)),
                 }
             }
             ord => ord,
@@ -115,40 +103,37 @@ impl<K: Eq + Ord, V> Ord for SplitOrderedEntry<K, V> {
 }
 
 impl<K, V> SplitOrderedEntry<K, V> {
-    fn reverse_bits(mut n: usize) -> usize {
-        let mut result = 0;
-        let bits = std::mem::size_of::<usize>() * 8;
-
-        for _ in 0..bits {
-            result = (result << 1) | (n & 1);
-            n >>= 1;
-        }
-
-        result
+    #[inline]
+    fn reverse_bits(n: usize) -> usize {
+        n.reverse_bits()
     }
 
     fn new_sentinel(bucket: usize) -> Self {
-        SplitOrderedEntry::Sentinel {
+        SplitOrderedEntry {
             split_key: Self::reverse_bits(bucket) & !1, // Clear LSB for sentinels
-            bucket,
+            kind: EntryKind::Sentinel { bucket },
         }
     }
 
     fn new_regular(hash: usize, key: K, value: V) -> Self {
-        SplitOrderedEntry::Regular {
+        SplitOrderedEntry {
             split_key: Self::reverse_bits(hash) | 1, // Set LSB for regular entries
-            hash,
-            key,
-            value: Some(value),
+            kind: EntryKind::Regular {
+                hash,
+                key,
+                value: Some(value),
+            },
         }
     }
 
     fn new_search(hash: usize, key: K) -> Self {
-        SplitOrderedEntry::Regular {
+        SplitOrderedEntry {
             split_key: Self::reverse_bits(hash) | 1, // Set LSB like regular entries
-            hash,
-            key,
-            value: None, // None indicates this is for searching
+            kind: EntryKind::Regular {
+                hash,
+                key,
+                value: None, // None indicates this is for searching
+            },
         }
     }
 }
@@ -288,12 +273,13 @@ where
 
         // Insert sentinel for bucket 0
         let sentinel_0 = SplitOrderedEntry::new_sentinel(0);
-        list.insert(sentinel_0.clone());
+        SortedCollection::insert(&list, sentinel_0.clone());
 
         // Find sentinel 0 using find_from
         let head = list.head.load(Ordering::Acquire);
         let head_pos = ListNodePosition::from_node(head);
-        let loc = list.find_from_internal(Some(&head_pos), &sentinel_0, true);
+        // SAFETY: single-threaded construction — no concurrent access or reclamation.
+        let loc = unsafe { list.find_from_internal(Some(&head_pos), &sentinel_0, true) };
 
         let sentinel_0_ptr = match loc {
             Some(pos) => pos.node_ptr(),
@@ -357,22 +343,8 @@ where
             return 0;
         }
         // Find and clear the highest set bit
-        let highest_bit = 1usize << (63 - bucket.leading_zeros());
+        let highest_bit = 1usize << (usize::BITS - 1 - bucket.leading_zeros());
         bucket & !highest_bit
-    }
-
-    /// Checks if a bucket's sentinel has been initialized.
-    /// Uses atomic bitmap to track initialization status.
-    fn is_bucket_initialized(&self, bucket: usize) -> bool {
-        let word_idx = bucket / 64;
-        let bit_idx = bucket % 64;
-
-        if word_idx >= self.buckets_initialized.len() {
-            return false;
-        }
-
-        let word = self.buckets_initialized[word_idx].load(Ordering::Acquire);
-        (word & (1 << bit_idx)) != 0
     }
 
     /// Lazily initializes a bucket's sentinel if not already present.
@@ -450,15 +422,20 @@ where
         let sentinel = SplitOrderedEntry::new_sentinel(bucket);
         let parent_pos = ListNodePosition::from_node(parent_ptr);
 
+        // SAFETY: caller holds a pinned guard (called from insert/remove/find/update
+        // which are called from MapCollection methods that pin the guard).
         // insert_from_internal returns None if already exists, that's ok
-        let _ = self
-            .list
-            .insert_from_internal(sentinel.clone(), Some(&parent_pos));
+        let _ = unsafe {
+            self.list
+                .insert_from_internal(sentinel.clone(), Some(&parent_pos))
+        };
 
         // Find the sentinel (whether we inserted it or another thread did)
-        let loc = self
-            .list
-            .find_from_internal(Some(&parent_pos), &sentinel, true);
+        // SAFETY: guard pinned by caller.
+        let loc = unsafe {
+            self.list
+                .find_from_internal(Some(&parent_pos), &sentinel, true)
+        };
 
         // Store the sentinel pointer for O(1) future access
         match loc {
@@ -532,33 +509,33 @@ where
 }
 
 // ============================================================================
-// HashMapNode implementation for SortedListNode<SplitOrderedEntry<K, V>>
+// MapNode implementation for SortedListNode<SplitOrderedEntry<K, V>>
 // ============================================================================
 
-impl<K, V> HashMapNode<K, V> for SortedListNode<SplitOrderedEntry<K, V>>
+impl<K, V> MapNode<K, V> for SortedListNode<SplitOrderedEntry<K, V>>
 where
     K: Eq,
 {
     fn key(&self) -> &K {
-        match CollectionNode::key(self) {
-            SplitOrderedEntry::Regular { key, .. } => key,
-            SplitOrderedEntry::Sentinel { .. } => panic!("called key() on sentinel node"),
+        match &CollectionNode::key(self).kind {
+            EntryKind::Regular { key, .. } => key,
+            EntryKind::Sentinel { .. } => panic!("called key() on sentinel node"),
         }
     }
 
     fn value(&self) -> Option<&V> {
-        match CollectionNode::key(self) {
-            SplitOrderedEntry::Regular { value, .. } => value.as_ref(),
-            SplitOrderedEntry::Sentinel { .. } => None,
+        match &CollectionNode::key(self).kind {
+            EntryKind::Regular { value, .. } => value.as_ref(),
+            EntryKind::Sentinel { .. } => None,
         }
     }
 }
 
 // ============================================================================
-// HashMapCollection implementation for SplitOrderedHashMap
+// MapCollection implementation for SplitOrderedHashMap
 // ============================================================================
 
-impl<K, V, G, S> HashMapCollection<K, V> for SplitOrderedHashMap<K, V, G, S>
+impl<K, V, G, S> MapCollectionInternal<K, V> for SplitOrderedHashMap<K, V, G, S>
 where
     K: Hash + Eq + Ord + Clone,
     V: Clone,
@@ -582,14 +559,17 @@ where
         let new_entry = SplitOrderedEntry::new_regular(hash, key.clone(), value);
 
         // Try to insert - returns position if successful
-        if let Some(pos) = self
-            .list
-            .insert_from_internal(new_entry, Some(&sentinel_pos))
-        {
-            self.size.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: guard pinned by caller (MapCollection::insert).
+        if let Some(pos) = unsafe {
+            self.list
+                .insert_from_internal(new_entry, Some(&sentinel_pos))
+        } {
+            // wrapping_add: size counter can temporarily wrap due to concurrent
+            // remove executing between list insert and this fetch_add.
+            // The counter self-corrects; wrapping matches atomic semantics.
+            let size = self.size.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
 
-            let size = self.size.load(Ordering::Relaxed);
-            if size > 0 && (size / bucket_size) >= MAX_LOAD {
+            if (size / bucket_size) >= MAX_LOAD {
                 self.resize();
             }
             return Some(pos.node_ptr());
@@ -608,10 +588,11 @@ where
 
         let search_entry = SplitOrderedEntry::new_search(hash, key.clone());
 
-        if let Some(pos) = self
-            .list
-            .remove_from_internal(Some(&sentinel_pos), &search_entry)
-        {
+        // SAFETY: guard pinned by caller (MapCollection::remove).
+        if let Some(pos) = unsafe {
+            self.list
+                .remove_from_internal(Some(&sentinel_pos), &search_entry)
+        } {
             self.size.fetch_sub(1, Ordering::Relaxed);
             Some(pos.node_ptr())
         } else {
@@ -628,9 +609,12 @@ where
 
         let search_entry = SplitOrderedEntry::new_search(hash, key.clone());
 
-        self.list
-            .find_from_internal(Some(&sentinel_pos), &search_entry, true)
-            .map(|pos| pos.node_ptr())
+        // SAFETY: guard pinned by caller (MapCollection::find_and_apply / contains).
+        unsafe {
+            self.list
+                .find_from_internal(Some(&sentinel_pos), &search_entry, true)
+                .map(|pos| pos.node_ptr())
+        }
     }
 
     fn apply_on_internal<F, R>(&self, node: *mut Self::Node, f: F) -> Option<R>
@@ -643,9 +627,14 @@ where
 
         let node = MarkedPtr::unmask(node);
 
+        // SAFETY: `node` was obtained from `find_internal` which returns a pointer into
+        // the SortedList. The pointer is valid because the epoch guard (pinned by the
+        // caller via `find_and_apply`) prevents deallocation while we hold a reference.
+        // `MarkedPtr::unmask` above strips any mark bits, yielding a properly aligned pointer.
         unsafe {
-            match CollectionNode::key(&*node) {
-                SplitOrderedEntry::Regular {
+            let entry = CollectionNode::key(&*node);
+            match &entry.kind {
+                EntryKind::Regular {
                     key,
                     value: Some(v),
                     ..
@@ -655,22 +644,47 @@ where
         }
     }
 
+    fn update_internal(&self, key: K, value: V) -> bool {
+        let hash = self.hash_key(&key);
+        let bucket = hash % self.bucket_size.load(Ordering::Acquire);
+        let Some(sentinel_ptr) = self.get_bucket_sentinel(bucket) else {
+            return false;
+        };
+        let sentinel_pos = ListNodePosition::from_node(sentinel_ptr);
+        let entry = SplitOrderedEntry::new_regular(hash, key, value);
+        // SAFETY: guard pinned by caller (MapCollection::update). The replaced node is
+        // unlinked AND retired internally by the inner list's node-replacement update.
+        unsafe {
+            SortedCollectionInternal::update_internal(&self.list, Some(&sentinel_pos), entry)
+                .is_some()
+        }
+    }
+
     fn len_internal(&self) -> usize {
         self.len()
     }
 }
 
-// TODO: Re-enable tests after adding G: Guard to HashMapCollection
-// Tests temporarily disabled during Guard refactoring
-#[cfg(any())] // Disabled - always false
+impl<K, V, G, S> MapCollection<K, V> for SplitOrderedHashMap<K, V, G, S>
+where
+    K: Hash + Eq + Ord + Clone,
+    V: Clone,
+    G: Guard,
+    S: BuildHasher,
+{
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::guard::DeferredGuard;
     use std::{sync::Arc, thread};
 
+    type DeferredHashMap<K, V> = SplitOrderedHashMap<K, V, DeferredGuard>;
+
     #[test]
     fn test_basic_operations() {
-        let map = DeferredHashMap::new(SplitOrderedHashMap::new());
+        let map: DeferredHashMap<i32, &str> = DeferredHashMap::new();
 
         // Test insertions
         assert!(map.insert(5, "five"));
@@ -678,9 +692,9 @@ mod tests {
         assert!(map.insert(7, "seven"));
 
         // Test get
-        assert_eq!(*map.get(&5).unwrap(), "five");
-        assert_eq!(*map.get(&3).unwrap(), "three");
-        assert_eq!(*map.get(&7).unwrap(), "seven");
+        assert_eq!(map.get(&5), Some("five"));
+        assert_eq!(map.get(&3), Some("three"));
+        assert_eq!(map.get(&7), Some("seven"));
         assert!(map.get(&10).is_none());
 
         // Test update (insert returns false if key exists)
@@ -688,7 +702,7 @@ mod tests {
         // For update, we need to remove then insert
         map.remove(&5);
         assert!(map.insert(5, "FIVE"));
-        assert_eq!(*map.get(&5).unwrap(), "FIVE");
+        assert_eq!(map.get(&5), Some("FIVE"));
 
         // Test contains
         assert!(map.contains(&5));
@@ -707,7 +721,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_insertions() {
-        let map = Arc::new(DeferredHashMap::new(SplitOrderedHashMap::new()));
+        let map: Arc<DeferredHashMap<usize, usize>> = Arc::new(DeferredHashMap::new());
         let num_threads = 16;
         let items_per_thread = 1000;
 
@@ -730,14 +744,18 @@ mod tests {
         assert_eq!(map.len(), num_threads * items_per_thread);
 
         for i in 0..(num_threads * items_per_thread) {
-            let val = map.get(&i).map(|g| *g);
-            assert_eq!(val, Some(i * 2), "Missing or wrong value for key: {}", i);
+            assert_eq!(
+                map.get(&i),
+                Some(i * 2),
+                "Missing or wrong value for key: {}",
+                i
+            );
         }
     }
 
     #[test]
     fn test_simple_concurrent() {
-        let map = Arc::new(DeferredHashMap::new(SplitOrderedHashMap::new()));
+        let map: Arc<DeferredHashMap<usize, usize>> = Arc::new(DeferredHashMap::new());
 
         // Just two threads, fewer operations
         let h1 = {
@@ -764,7 +782,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_mixed() {
-        let map = Arc::new(DeferredHashMap::new(SplitOrderedHashMap::new()));
+        let map: Arc<DeferredHashMap<usize, usize>> = Arc::new(DeferredHashMap::new());
         let num_threads = 6;
         let num_operations = 1000;
 
@@ -802,5 +820,160 @@ mod tests {
         }
 
         println!("Final map size: {}", map.len());
+    }
+
+    #[test]
+    fn test_update_basic() {
+        let map: DeferredHashMap<i32, &str> = DeferredHashMap::new();
+
+        // Update on missing key returns false
+        assert!(!map.update(1, "one"));
+
+        // Insert, then update
+        assert!(map.insert(1, "one"));
+        assert!(map.update(1, "ONE"));
+        assert_eq!(map.get(&1), Some("ONE"));
+
+        // Len unchanged after update
+        assert_eq!(map.len(), 1);
+
+        // Update again
+        assert!(map.update(1, "uno"));
+        assert_eq!(map.get(&1), Some("uno"));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn test_update_value_replacement() {
+        let map: DeferredHashMap<String, String> = DeferredHashMap::new();
+
+        map.insert("key".to_string(), "old".to_string());
+        assert_eq!(map.get(&"key".to_string()), Some("old".to_string()));
+
+        assert!(map.update("key".to_string(), "new".to_string()));
+        assert_eq!(map.get(&"key".to_string()), Some("new".to_string()));
+
+        // Key still exists, len unchanged
+        assert!(map.contains(&"key".to_string()));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn test_update_after_remove() {
+        let map: DeferredHashMap<i32, i32> = DeferredHashMap::new();
+
+        map.insert(1, 100);
+        map.remove(&1);
+
+        // Update on removed key returns false
+        assert!(!map.update(1, 200));
+        assert!(!map.contains(&1));
+    }
+
+    #[test]
+    fn test_update_multiple_keys() {
+        let map: DeferredHashMap<i32, &str> = DeferredHashMap::new();
+
+        for i in 0..100 {
+            map.insert(i, "old");
+        }
+
+        // Update every other key
+        for i in (0..100).step_by(2) {
+            assert!(map.update(i, "new"));
+        }
+
+        // Verify
+        for i in 0..100 {
+            if i % 2 == 0 {
+                assert_eq!(map.get(&i), Some("new"), "key {} should be updated", i);
+            } else {
+                assert_eq!(map.get(&i), Some("old"), "key {} should be unchanged", i);
+            }
+        }
+        assert_eq!(map.len(), 100);
+    }
+
+    #[test]
+    fn test_concurrent_update() {
+        let map: Arc<DeferredHashMap<usize, usize>> = Arc::new(DeferredHashMap::new());
+        let num_keys = 100;
+        let num_threads = 8;
+        let updates_per_thread = 1000;
+
+        // Pre-populate
+        for i in 0..num_keys {
+            map.insert(i, 0);
+        }
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|t| {
+                let map = Arc::clone(&map);
+                thread::spawn(move || {
+                    for i in 0..updates_per_thread {
+                        let key = i % num_keys;
+                        map.update(key, t * updates_per_thread + i);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // All keys should still exist with some value
+        assert_eq!(map.len(), num_keys);
+        for i in 0..num_keys {
+            assert!(map.contains(&i), "key {} should still exist", i);
+        }
+    }
+
+    #[test]
+    fn test_concurrent_update_insert_remove() {
+        // Mix update with insert and remove to test interaction
+        let map: Arc<DeferredHashMap<usize, usize>> = Arc::new(DeferredHashMap::new());
+        let num_keys = 50;
+        let num_threads = 12;
+        let ops_per_thread = 5000;
+
+        // Pre-populate half the keys
+        for i in 0..num_keys / 2 {
+            map.insert(i, i);
+        }
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|t| {
+                let map = Arc::clone(&map);
+                thread::spawn(move || {
+                    for i in 0..ops_per_thread {
+                        let key = (t * ops_per_thread + i) % num_keys;
+                        match i % 4 {
+                            0 => {
+                                map.insert(key, i);
+                            }
+                            1 => {
+                                map.update(key, i * 10);
+                            }
+                            2 => {
+                                let _ = map.get(&key);
+                            }
+                            3 => {
+                                map.remove(&key);
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Should not panic or hang — verify structural integrity
+        let len = map.len();
+        assert!(len <= num_keys, "len {} should be <= {}", len, num_keys);
     }
 }

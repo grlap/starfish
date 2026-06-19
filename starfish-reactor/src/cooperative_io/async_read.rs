@@ -1,3 +1,8 @@
+//! Asynchronous read trait and extension methods.
+//!
+//! Defines `AsyncRead` for cooperative non-blocking reads with optional timeouts,
+//! and `AsyncReadExtension` providing convenience methods like `read_exact`.
+
 use std::future::Future;
 use std::io;
 

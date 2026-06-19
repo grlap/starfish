@@ -83,6 +83,9 @@ impl Drop for DeferredGuard {
         }
 
         for node in nodes.drain(..) {
+            // SAFETY: Each pointer was registered exactly once via `defer_destroy`, guaranteed
+            // by the runtime duplicate check above (which panics before reaching this loop).
+            // The `dealloc` function matches the original type via the transmute at registration.
             unsafe {
                 (node.dealloc)(node.ptr);
             }
@@ -125,6 +128,10 @@ impl Guard for DeferredGuard {
         // No-op for DeferredGuard - protection is provided by the stored guard
     }
 
+    fn repin(_: &mut Self::ReadGuard) {
+        // No-op: deferred reclamation has no epoch state to refresh.
+    }
+
     unsafe fn defer_destroy<N>(&self, node: *mut N, dealloc: unsafe fn(*mut N)) {
         #[cfg(debug_assertions)]
         {
@@ -137,6 +144,9 @@ impl Guard for DeferredGuard {
 
         let node = DeferredNode {
             ptr: node as *mut (),
+            // SAFETY: `*mut N` and `*mut ()` have the same size and ABI (both are thin
+            // pointers), so transmuting `fn(*mut N)` to `fn(*mut ())` is valid. The erased
+            // pointer will only be passed back to this function, which was created for type N.
             dealloc: unsafe {
                 std::mem::transmute::<unsafe fn(*mut N), unsafe fn(*mut ())>(dealloc)
             },
@@ -145,7 +155,7 @@ impl Guard for DeferredGuard {
     }
 
     unsafe fn make_ref<'a, T: 'a>(ptr: *const T) -> Self::GuardedRef<'a, T> {
-        // Safety: caller guarantees ptr is valid for lifetime 'a
+        // SAFETY: Caller guarantees ptr is valid for lifetime 'a.
         DeferredRef::new(unsafe { &*ptr })
     }
 }
@@ -163,6 +173,8 @@ mod tests {
         let ptr = Box::into_raw(boxed);
 
         // Defer destruction
+        // SAFETY: `ptr` was obtained from `Box::into_raw` above and has not been freed,
+        // and the dealloc closure reconstructs the original `Box` to free it.
         unsafe {
             guard.defer_destroy(ptr, |p| {
                 drop(Box::from_raw(p));
@@ -175,8 +187,10 @@ mod tests {
     #[test]
     fn test_deferred_ref() {
         let value = 42;
-        let _guard = DeferredGuard::pin(); // ReadGuard is ()
+        DeferredGuard::pin(); // ReadGuard is ()
 
+        // SAFETY: `&value` is a valid reference on the stack and remains live for the
+        // duration of this block, satisfying `make_ref`'s lifetime requirement.
         unsafe {
             let guarded = DeferredGuard::make_ref(&value);
             assert_eq!(*guarded, 42);
@@ -190,6 +204,8 @@ mod tests {
         for i in 0..10 {
             let boxed = Box::new(i);
             let ptr = Box::into_raw(boxed);
+            // SAFETY: `ptr` was obtained from `Box::into_raw` on the line above and is
+            // unique (each loop iteration creates a new allocation).
             unsafe {
                 guard.defer_destroy(ptr, |p| {
                     drop(Box::from_raw(p));
@@ -197,5 +213,10 @@ mod tests {
             }
         }
         // All 10 nodes freed when guard drops
+    }
+
+    #[test]
+    fn test_repin_is_noop() {
+        DeferredGuard::repin(&mut ());
     }
 }

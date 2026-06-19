@@ -1,0 +1,29 @@
+[package]
+name = "starfish-http-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+starfish-http = { path = ".." }
+
+[[bin]]
+name = "h3_frame_decode"
+path = "fuzz_targets/h3_frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "qpack_decode"
+path = "fuzz_targets/qpack_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

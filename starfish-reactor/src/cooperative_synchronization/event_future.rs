@@ -1,3 +1,9 @@
+//! Multi-waiter cooperative event future.
+//!
+//! Provides `EventFuture` (wrapped as `CooperativeEventFuture`) that allows multiple
+//! tasks to await a shared event. When the event is signaled, all waiting tasks are
+//! rescheduled on their respective reactors.
+
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::future::Future;

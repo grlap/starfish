@@ -1,20 +1,26 @@
+//! Multi-reactor coordination for parallel cooperative scheduling.
+//!
+//! Provides the `Coordinator` struct for spawning and managing multiple `Reactor`
+//! instances across threads, and the `CooperativeInitializer` trait for user-defined
+//! per-reactor initialization logic.
+
 use std::cell::UnsafeCell;
 use std::future::Future;
 use std::ops::Index;
 use std::ptr;
 use std::sync::atomic::{self, AtomicPtr};
-use std::sync::{Arc, Barrier, BarrierWaitResult};
+use std::sync::{Arc, BarrierWaitResult};
 
 use crate::arc_pointer_dyn;
 use crate::cooperative_io::DefaultIOManagerCreateOptions;
 use crate::cooperative_io::io_manager::IOManagerCreateOptions;
+use crate::cooperative_synchronization::init_barrier::InitBarrier;
 use crate::rc_pointer::ArcPointer;
 use crate::reactor::{ExternalReactor, Reactor};
-use starfish_core::preemptive_synchronization::countdown_event::CountdownEvent;
 
-pub trait CooperativeIntitializer {
-    fn init(&mut self);
-    fn uninit(&mut self);
+pub trait CooperativeInitializer {
+    fn init(&self);
+    fn uninit(&self);
 
     fn init_reactor(&self, reactor: &Reactor);
     fn uninit_reactor(&self, reactor: &Reactor);
@@ -23,9 +29,9 @@ pub trait CooperativeIntitializer {
 // Defines a Cooperative Coordinator.
 //
 pub struct Coordinator {
-    reactors: Vec<Reactor>,
+    reactors: Vec<Option<Reactor>>,
     handles: Vec<std::thread::JoinHandle<()>>,
-    initializers: Vec<ArcPointer<dyn CooperativeIntitializer + Send + Sync>>,
+    initializers: Vec<ArcPointer<dyn CooperativeInitializer + Send + Sync>>,
 }
 
 impl Default for Coordinator {
@@ -60,39 +66,28 @@ impl Coordinator {
 
         let io_manager_create_options: Arc<T> = Arc::new(io_manager_create_options);
 
-        // Reserve capacity for reactors. Each thread will write directly to its slot.
-        // We use set_len to avoid creating placeholder reactors that would need to be dropped.
+        // Pre-fill with None. Each thread will write Some(reactor) to its slot.
         //
-        self.reactors = Vec::with_capacity(reactor_count);
-        // SAFETY: Each slot will be initialized exactly once by its corresponding thread
-        // before any reads occur. The countdown_init barrier ensures all slots are written
-        // before any thread proceeds to use them.
-        #[allow(clippy::uninit_vec)]
-        unsafe {
-            self.reactors.set_len(reactor_count)
-        };
+        self.reactors = (0..reactor_count).map(|_| None).collect();
 
         // Run Initializers.
         //
-        for initalizer in &mut self.initializers {
-            initalizer.init();
+        for initializer in &self.initializers {
+            initializer.init();
         }
 
         // Pass Coordinator to the Reactor threads.
         //
-        let start_barrier = Arc::new(Barrier::new(reactor_count + 1));
+        let init_barrier = InitBarrier::new(reactor_count);
 
         let coordinator_ptr = Arc::new(AtomicPtr::new(self));
-
-        let countdown_init = Arc::new(CountdownEvent::new(reactor_count));
 
         // For each reactor create a thread to and store the handles.
         //
         self.handles = (0..reactor_count)
             .map(|reactor_index| {
                 let coordinator_ptr_clone = Arc::clone(&coordinator_ptr);
-                let countdown_clone = Arc::clone(&countdown_init);
-                let start_barrier_clone = start_barrier.clone();
+                let mut guard = init_barrier.guard();
                 let io_manager_create_options_clone = io_manager_create_options.clone();
 
                 std::thread::spawn(move || {
@@ -120,41 +115,36 @@ impl Coordinator {
                         local_reactor.set_reactor_index(reactor_index);
                         local_reactor.set_is_in_shutdown_flag(false);
 
-                        // Write the reactor directly to the uninitialized slot.
-                        // SAFETY: The slot is uninitialized (set_len was called without init),
-                        // and each thread writes exactly once to its own slot.
-                        ptr::write(
-                            &mut local_coordinator.reactors[reactor_index],
-                            local_reactor,
-                        );
+                        // Write the reactor to its slot.
+                        //
+                        local_coordinator.reactors[reactor_index] = Some(local_reactor);
 
                         // Set reactor local thread instance.
                         //
-                        Reactor::set_local_instance(&local_coordinator.reactors[reactor_index]);
+                        Reactor::set_local_instance(
+                            local_coordinator.reactors[reactor_index].as_ref().unwrap(),
+                        );
 
                         // Read Reactor Instance from thread local storage.
                         //
                         let local_reactor = Reactor::local_instance();
 
-                        // Call Initalizers to init reactor.
+                        // Call Initializers to init reactor.
                         //
-                        for initalizer in &local_coordinator.initializers {
-                            initalizer.init_reactor(local_reactor);
+                        for initializer in &local_coordinator.initializers {
+                            initializer.init_reactor(local_reactor);
                         }
 
-                        // Signal that a reactor was created.
+                        // Signal init complete and wait for all threads + main.
                         //
-                        countdown_clone.signal();
-                        countdown_clone.wait();
-
-                        start_barrier_clone.wait();
+                        guard.ready();
 
                         local_reactor.run(); // Call run() on each reactor in its own thread
 
-                        // Call initalizers to uninit reactor.
+                        // Call initializers to uninit reactor.
                         //
-                        for initalizer in &local_coordinator.initializers {
-                            initalizer.uninit_reactor(local_reactor);
+                        for initializer in &local_coordinator.initializers {
+                            initializer.uninit_reactor(local_reactor);
                         }
                     }
 
@@ -163,50 +153,61 @@ impl Coordinator {
             })
             .collect();
 
-        countdown_init.wait();
-
-        start_barrier.wait()
+        init_barrier.wait()
     }
 
-    pub fn register_initializer<T: CooperativeIntitializer + Sync + Send + 'static>(
+    pub fn register_initializer<T: CooperativeInitializer + Sync + Send + 'static>(
         &mut self,
         initializer: T,
     ) {
         self.initializers.push(arc_pointer_dyn!(
             initializer,
-            dyn CooperativeIntitializer + Send + Sync
+            dyn CooperativeInitializer + Send + Sync
         ));
     }
 
     // Joins for all Reactor threads.
     //
     pub fn join_all(&mut self) -> Result<(), Box<dyn std::any::Any + Send>> {
-        for index in 0..self.reactors.len() {
-            self.reactors[index].set_is_in_shutdown_flag(true);
+        for reactor in self.reactors.iter().flatten() {
+            reactor.set_is_in_shutdown_flag(true);
         }
 
         // Take ownership of the handles vector, replacing it with an empty vector.
         //
         let handles = std::mem::take(&mut self.handles);
 
-        // Join each thread and return early if any thread panicked.
+        // Join ALL threads before touching self.reactors. If we returned early
+        // on the first panic, remaining threads would be detached and could
+        // still reference reactors we're about to clear.
         //
+        let mut first_error = None;
         for handle in handles {
-            handle.join()?;
+            if let Err(e) = handle.join()
+                && first_error.is_none()
+            {
+                first_error = Some(e);
+            }
         }
 
         // Remove all the reactors from the list.
         //
         self.reactors.clear();
-        self.handles.clear();
 
         // Reset the main thread's TLS to avoid stale pointers.
         //
         Coordinator::reset_local_instance();
 
-        Ok(())
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
+    /// # Preconditions
+    /// This intentionally widens the lifetime to `'static` for cross-thread convenience.
+    /// Callers must ensure returned handles are only used while coordinator-owned
+    /// reactors are initialized, and never after `join_all()` clears them.
     #[inline]
     pub fn reactor(index: usize) -> ExternalReactor<'static> {
         Coordinator::instance().reactor_instance(index)
@@ -216,7 +217,11 @@ impl Coordinator {
     //
     #[inline]
     pub fn reactor_instance(&mut self, index: usize) -> ExternalReactor<'_> {
-        ExternalReactor::new(&mut self.reactors[index])
+        ExternalReactor::new(
+            self.reactors[index]
+                .as_mut()
+                .expect("reactor not initialized"),
+        )
     }
 
     // Gets reactor count.
@@ -241,7 +246,7 @@ impl Coordinator {
     }
 
     pub fn for_each_reactor_with_result<
-        T: Default + 'static + Send,
+        T: 'static + Send,
         F: Fn() -> R,
         R: Future<Output = T> + 'static + Send,
     >(
@@ -259,15 +264,18 @@ impl Coordinator {
             .collect()
     }
 
-    // Gets the Coordinator instance.
-    //
+    /// Gets the Coordinator instance.
+    ///
+    /// # Preconditions
+    /// Must be called only on threads where `set_local_instance` was executed and
+    /// before `reset_local_instance`. The TLS raw pointer must remain valid.
     #[inline]
     pub fn instance<'a>() -> &'a mut Self {
         let coordinator_ptr =
             COORDINATOR_INSTANCE.with(|s| unsafe { *s.get() }) as *mut Coordinator;
 
         if coordinator_ptr.is_null() {
-            panic!("Coordinator not initalized");
+            panic!("Coordinator not initialized");
         }
 
         unsafe { &mut *coordinator_ptr }
@@ -295,7 +303,9 @@ impl Index<usize> for Coordinator {
 
     #[inline]
     fn index(&self, index: usize) -> &Self::Output {
-        &self.reactors[index]
+        self.reactors[index]
+            .as_ref()
+            .expect("reactor not initialized")
     }
 }
 

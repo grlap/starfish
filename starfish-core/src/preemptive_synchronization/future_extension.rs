@@ -1,3 +1,9 @@
+//! Synchronous future evaluation for testing and initialization.
+//!
+//! Provides `FutureExtension::unwrap_result()`, which polls a future
+//! exactly once with a no-op waker and panics if it returns `Pending`.
+//! Useful for evaluating futures known to be immediately ready.
+
 use std::future::Future;
 use std::pin::Pin;
 use std::ptr;
@@ -21,6 +27,9 @@ impl<F: Future> FutureExtension for F {
                 |_| {},
                 |_| {},
             );
+            // SAFETY: The VTABLE is a valid, 'static RawWakerVTable whose clone/wake/drop
+            // functions are all no-ops, so the resulting Waker will never dereference the
+            // null data pointer. This satisfies Waker::from_raw's contract.
             unsafe { Waker::from_raw(RawWaker::new(ptr::null(), &VTABLE)) }
         }
 
@@ -30,6 +39,8 @@ impl<F: Future> FutureExtension for F {
         let mut future = self;
 
         // Pin the future on the stack
+        // SAFETY: `future` is a local variable that is never moved after this point,
+        // so the Pin contract (the referent will not be moved) is upheld.
         let mut pinned = unsafe { Pin::new_unchecked(&mut future) };
 
         match pinned.as_mut().poll(&mut cx) {

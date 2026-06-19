@@ -369,9 +369,8 @@ mod sorted_list_stress_tests {
         // Verify operations correctly skip marked nodes
         for i in 0..num_threads * values_per_thread {
             assert!(!list.contains(&i), "Value {} should not be found", i);
-            assert_eq!(
-                list.contains(&i),
-                false,
+            assert!(
+                !list.contains(&i),
                 "find_value should return None for {}",
                 i
             );
@@ -419,7 +418,7 @@ mod sorted_list_stress_tests {
                 thread::spawn(move || {
                     for i in 0..1000 {
                         match t % 4 {
-                            0 => list.insert(usize::MIN + i),
+                            0 => list.insert(i),
                             1 => list.insert(usize::MAX - i),
                             2 => list.insert(usize::MAX / 2 + i),
                             3 => list.insert(usize::MAX / 2 - i),

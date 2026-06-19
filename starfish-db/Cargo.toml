@@ -1,0 +1,17 @@
+[package]
+name = "starfish-db"
+version = "0.1.0"
+edition = "2024"
+description = "Embedded database with stream support built on starfish async runtime"
+
+[dependencies]
+# Component crates (uncomment as implemented)
+# starfish-storage = { version = "0.1.0", path = "../starfish-storage" }
+# starfish-stream = { version = "0.1.0", path = "../starfish-stream" }
+# starfish-wal-server = { version = "0.1.0", path = "../starfish-wal-server" }
+# starfish-query = { version = "0.1.0", path = "../starfish-query" }
+
+[dev-dependencies]
+criterion = "0.5"
+rstest = "0.18"
+tempfile = "3.14"

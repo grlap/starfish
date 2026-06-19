@@ -1,3 +1,9 @@
+//! macOS network I/O via kqueue event notifications.
+//!
+//! Implements async TCP (bind, accept, connect, read, write) and UDP (bind, send_to,
+//! recv_from) operations using kqueue readiness events and non-blocking sockets,
+//! including ECN-aware UDP send/receive metadata used by [`crate::cooperative_io::udp_socket`].
+
 use std::cell::RefCell;
 use std::io::{self, Read, Write};
 use std::mem;
@@ -13,9 +19,32 @@ use kqueue_sys::FilterFlag;
 use kqueue_sys::kevent;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
-use crate::cooperative_io::io_timeout::IOTimeout;
+use crate::cooperative_io::{io_timeout::IOTimeout, udp_socket::UdpEcnCodepoint};
 
 use super::io_wait_future::{IOCallbackWrapper, IOWaitFuture};
+
+#[repr(C)]
+struct ControlMessageBuffer {
+    bytes: [u8; 64],
+    _align: [libc::cmsghdr; 0],
+}
+
+impl ControlMessageBuffer {
+    fn new() -> Self {
+        Self {
+            bytes: [0; 64],
+            _align: [],
+        }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut libc::c_void {
+        self.bytes.as_mut_ptr().cast()
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+}
 
 async fn create_socket(
     domain: Domain,
@@ -89,8 +118,9 @@ pub(crate) async fn tcp_stream_connect(
 
     let _ = pinned_io_wait_future.await?;
 
-    // TODO: check the connection status with getsockopt(SO_ERROR).
-    //
+    if let Some(err) = socket.take_error()? {
+        return Err(err);
+    }
 
     Ok(unsafe { TcpStream::from_raw_fd(socket.into_raw_fd()) })
 }
@@ -251,11 +281,201 @@ pub(crate) async fn udp_socket_bind<A: ToSocketAddrs>(socket_address: A) -> io::
     Ok(udp_socket)
 }
 
+fn ignore_unsupported_sockopt_error(result: libc::c_int) -> io::Result<()> {
+    if result == 0 {
+        return Ok(());
+    }
+
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(code)
+            if code == libc::ENOPROTOOPT
+                || code == libc::EINVAL
+                || code == libc::EOPNOTSUPP
+                || code == libc::ENOTSUP =>
+        {
+            Ok(())
+        }
+        _ => Err(err),
+    }
+}
+
+pub(crate) fn udp_socket_enable_ecn(udp_socket: &UdpSocket) -> io::Result<()> {
+    let one: libc::c_int = 1;
+    let fd = udp_socket.as_raw_fd();
+
+    // SAFETY: `fd` is a live UDP socket and the `one` pointers are valid for
+    // the duration of the `setsockopt` calls.
+    unsafe {
+        ignore_unsupported_sockopt_error(libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_RECVTOS,
+            (&one as *const libc::c_int).cast(),
+            mem::size_of_val(&one) as libc::socklen_t,
+        ))?;
+        ignore_unsupported_sockopt_error(libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_RECVTCLASS,
+            (&one as *const libc::c_int).cast(),
+            mem::size_of_val(&one) as libc::socklen_t,
+        ))?;
+    }
+
+    Ok(())
+}
+
+fn sockaddr_storage_to_socket_addr(
+    storage: &libc::sockaddr_storage,
+    len: libc::socklen_t,
+) -> Option<SocketAddr> {
+    // SAFETY: `storage` comes from the OS and `len` matches the received family.
+    let sock_addr = unsafe { SockAddr::new(*storage, len) };
+    sock_addr.as_socket()
+}
+
+fn parse_ecn_from_msghdr(msghdr: &mut libc::msghdr) -> Option<UdpEcnCodepoint> {
+    // SAFETY: `msghdr` comes from `recvmsg`, so its control buffer is valid for
+    // the duration of this ancillary-data walk.
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(msghdr);
+        while !cmsg.is_null() {
+            match ((*cmsg).cmsg_level, (*cmsg).cmsg_type) {
+                (libc::IPPROTO_IP, libc::IP_TOS) => {
+                    if (*cmsg).cmsg_len < libc::CMSG_LEN(mem::size_of::<u8>() as _) as _ {
+                        return None;
+                    }
+                    let tos = *(libc::CMSG_DATA(cmsg) as *const u8);
+                    return UdpEcnCodepoint::from_bits(tos);
+                }
+                (libc::IPPROTO_IPV6, libc::IPV6_TCLASS) => {
+                    if (*cmsg).cmsg_len < libc::CMSG_LEN(mem::size_of::<libc::c_int>() as _) as _ {
+                        return None;
+                    }
+                    let tclass = *(libc::CMSG_DATA(cmsg) as *const libc::c_int) as u8;
+                    return UdpEcnCodepoint::from_bits(tclass);
+                }
+                _ => {
+                    cmsg = libc::CMSG_NXTHDR(msghdr, cmsg);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn populate_send_ecn_msghdr(
+    msghdr: &mut libc::msghdr,
+    control: &mut ControlMessageBuffer,
+    destination_address: SocketAddr,
+    ecn: Option<UdpEcnCodepoint>,
+) {
+    msghdr.msg_control = ptr::null_mut();
+    msghdr.msg_controllen = 0;
+
+    let Some(ecn) = ecn else {
+        return;
+    };
+
+    // SAFETY: `control` is aligned for `cmsghdr`, large enough for one `c_int`
+    // payload, and outlives the msghdr send operation.
+    unsafe {
+        msghdr.msg_control = control.as_mut_ptr();
+        msghdr.msg_controllen = control.len() as _;
+
+        let cmsg = libc::CMSG_FIRSTHDR(msghdr);
+        if cmsg.is_null() {
+            msghdr.msg_control = ptr::null_mut();
+            msghdr.msg_controllen = 0;
+            return;
+        }
+
+        (*cmsg).cmsg_level = if destination_address.is_ipv4() {
+            libc::IPPROTO_IP
+        } else {
+            libc::IPPROTO_IPV6
+        };
+        (*cmsg).cmsg_type = if destination_address.is_ipv4() {
+            libc::IP_TOS
+        } else {
+            libc::IPV6_TCLASS
+        };
+        (*cmsg).cmsg_len = libc::CMSG_LEN(mem::size_of::<libc::c_int>() as _) as _;
+        *(libc::CMSG_DATA(cmsg) as *mut libc::c_int) = ecn.bits() as libc::c_int;
+        msghdr.msg_controllen = libc::CMSG_SPACE(mem::size_of::<libc::c_int>() as _) as _;
+    }
+}
+
+fn udp_recv_from_sync(
+    raw_fd: i32,
+    buf: &mut [u8],
+) -> io::Result<(usize, SocketAddr, Option<UdpEcnCodepoint>)> {
+    // SAFETY: sockaddr_storage is a C struct where all-zero bytes is a valid representation.
+    let mut addr_storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    let mut control = ControlMessageBuffer::new();
+    // SAFETY: msghdr is a C struct where all-zero bytes is a valid representation.
+    let mut msghdr: libc::msghdr = unsafe { mem::zeroed() };
+    msghdr.msg_name = (&mut addr_storage as *mut libc::sockaddr_storage).cast();
+    msghdr.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    msghdr.msg_iov = &mut iov;
+    msghdr.msg_iovlen = 1;
+    msghdr.msg_control = control.as_mut_ptr();
+    msghdr.msg_controllen = control.len() as _;
+
+    // SAFETY: raw_fd is a live socket, msghdr points to valid buffers for the duration of the call.
+    let received = unsafe { libc::recvmsg(raw_fd, &mut msghdr, 0) };
+    if received < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let socket_addr = sockaddr_storage_to_socket_addr(&addr_storage, msghdr.msg_namelen).ok_or(
+        io::Error::new(io::ErrorKind::InvalidData, "Invalid socket address"),
+    )?;
+    let ecn = parse_ecn_from_msghdr(&mut msghdr);
+
+    Ok((received as usize, socket_addr, ecn))
+}
+
+fn udp_send_to_sync(
+    raw_fd: i32,
+    destination_address: SocketAddr,
+    buf: &mut [u8],
+    ecn: Option<UdpEcnCodepoint>,
+) -> io::Result<usize> {
+    let destination_addr = SockAddr::from(destination_address);
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    let mut control = ControlMessageBuffer::new();
+    // SAFETY: msghdr is a C struct where all-zero bytes is a valid representation.
+    let mut msghdr: libc::msghdr = unsafe { mem::zeroed() };
+    msghdr.msg_name = destination_addr.as_ptr() as *mut _;
+    msghdr.msg_namelen = destination_addr.len();
+    msghdr.msg_iov = &mut iov;
+    msghdr.msg_iovlen = 1;
+    populate_send_ecn_msghdr(&mut msghdr, &mut control, destination_address, ecn);
+
+    // SAFETY: raw_fd is a live socket, msghdr points to valid buffers for the duration of the call.
+    let sent = unsafe { libc::sendmsg(raw_fd, &msghdr, 0) };
+    if sent < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(sent as usize)
+}
+
 pub(crate) async fn udp_recv_from(
     udp_socket: &UdpSocket,
     buf: &mut [u8],
     timeout: &Option<IOTimeout>,
-) -> io::Result<(usize, SocketAddr)> {
+) -> io::Result<(usize, SocketAddr, Option<UdpEcnCodepoint>)> {
     let k_event = kevent {
         ident: udp_socket.as_raw_fd() as usize,
         filter: kqueue_sys::EventFilter::EVFILT_READ,
@@ -265,10 +485,8 @@ pub(crate) async fn udp_recv_from(
         flags: EventFlag::EV_ADD | EventFlag::EV_ENABLE | EventFlag::EV_CLEAR,
     };
 
-    let socket_addr: SocketAddr = unsafe { mem::zeroed() };
-
-    let socket_addr_cell = Rc::new(RefCell::new(socket_addr));
-    let socket_addr_cell_clone = socket_addr_cell.clone();
+    let recv_meta_cell = Rc::new(RefCell::new((SocketAddr::from(([0, 0, 0, 0], 0)), None)));
+    let recv_meta_cell_clone = recv_meta_cell.clone();
 
     // Create IOWaitFuture and wait for the operation to complete.
     //
@@ -281,11 +499,9 @@ pub(crate) async fn udp_recv_from(
             callback: move |k_event: &kevent, buf: &mut [u8]| -> io::Result<usize> {
                 assert_eq!(EventFilter::EVFILT_READ, k_event.filter);
 
-                let socket = unsafe { UdpSocket::from_raw_fd(k_event.ident as i32) };
-
-                let (recv_bytes, recv_socket_addr) = socket.recv_from(buf)?;
-                let _ = socket.into_raw_fd();
-                *socket_addr_cell_clone.borrow_mut() = recv_socket_addr;
+                let (recv_bytes, recv_socket_addr, recv_ecn) =
+                    udp_recv_from_sync(k_event.ident as i32, buf)?;
+                *recv_meta_cell_clone.borrow_mut() = (recv_socket_addr, recv_ecn);
 
                 Ok(recv_bytes)
             },
@@ -302,7 +518,8 @@ pub(crate) async fn udp_recv_from(
 
     // Return the socket address captured by the callback.
     //
-    Ok((recv_bytes, *socket_addr_cell.borrow()))
+    let (socket_addr, ecn) = *recv_meta_cell.borrow();
+    Ok((recv_bytes, socket_addr, ecn))
 }
 
 pub(crate) async fn udp_send_to(
@@ -310,6 +527,7 @@ pub(crate) async fn udp_send_to(
     destination_address: SocketAddr,
     buf: &mut [u8],
     timeout: &Option<IOTimeout>,
+    ecn: Option<UdpEcnCodepoint>,
 ) -> io::Result<usize> {
     let k_event = kevent {
         ident: udp_socket.as_raw_fd() as usize,
@@ -330,13 +548,7 @@ pub(crate) async fn udp_send_to(
         IOCallbackWrapper {
             callback: move |k_event: &kevent, buf: &mut [u8]| -> io::Result<usize> {
                 assert_eq!(EventFilter::EVFILT_WRITE, k_event.filter);
-
-                let socket = unsafe { UdpSocket::from_raw_fd(k_event.ident as i32) };
-
-                let result = socket.send_to(buf, destination_address);
-                let _ = socket.into_raw_fd();
-
-                result
+                udp_send_to_sync(k_event.ident as i32, destination_address, buf, ecn)
             },
         },
     );

@@ -9,7 +9,7 @@ Core library providing high-performance, lock-free concurrent data structures an
 ## Features
 
 - **Lock-free data structures** - Concurrent sorted lists, skip lists, and hash maps
-- **Atomic update operation** - UPDATE_MARK-based in-place updates without "missing key" windows
+- **Atomic value-CAS update** - `SkipList` maps update via an atomic value-pointer swap (`MapEntry`), never replacing the node — epoch-safe, no "missing key" window
 - **Batch insert optimization** - NodePosition-based O(1) amortized inserts for sorted data (6-7x faster for SortedList)
 - **Trait-based design** - Pluggable memory reclamation strategies (epoch-based, hazard pointers, reference counting)
 - **Synchronization primitives** - CountdownEvent and future utilities
@@ -22,8 +22,8 @@ The library follows a layered architecture separating algorithm implementation f
 ```
 User Code
    ↓ uses
-EpochGuardedCollection         ← Epoch-based memory safety (starfish-crossbeam)
-   ↓ wraps
+SkipList<T, EpochGuard>        ← Epoch-based memory safety (starfish-crossbeam)
+   ↓ EpochGuard implements Guard
 SortedCollection               ← Low-level algorithm trait
    ↓ implemented by
 SortedList, SkipList, etc.     ← Actual data structures
@@ -36,7 +36,7 @@ SortedList, SkipList, etc.     ← Actual data structures
 | Structure | Complexity | Batch Insert | Description |
 |-----------|------------|--------------|-------------|
 | `SortedList` | O(n) | 6-7x faster | Harris's lock-free linked list |
-| `SkipList` | O(log n) | ~10% faster | Probabilistic multi-level skip list (16 levels, p=0.5) |
+| `SkipList` | O(log n) | ~10% faster | Probabilistic multi-level skip list (32 levels, p=0.5) |
 
 ### Hash Maps
 
@@ -44,57 +44,97 @@ SortedList, SkipList, etc.     ← Actual data structures
 |-----------|------------|-------------|
 | `SplitOrderedHashMap` | O(1) avg | Lock-free hash map with split-ordered list |
 
+### Trie-Based Collections
+
+| Structure | Complexity | Description |
+|-----------|------------|-------------|
+| `SkipTrie` | O(log log u) | Concurrent sorted map combining x-fast trie prefix hashing with skip list buckets |
+| `YFastTrie` | O(log log u) | Concurrent key-value map with sorted-bucket partitioning |
+
 ### Other Structures
 
 | Structure | Description |
 |-----------|-------------|
 | `Treap` | Randomized binary search tree (sequential) |
-| `DeferredCollection` | Test wrapper with deferred node destruction |
+
+## Modules
+
+| Module | Description |
+|--------|-------------|
+| `data_structures` | Lock-free sorted collections, hash maps, tries, and internal primitives |
+| `data_structures::sorted` | Lock-free sorted collections (`SkipList`, `SortedList`, `Treap`) |
+| `data_structures::hash` | Hash-based collections (`SplitOrderedHashMap`, `MapCollection` trait) |
+| `data_structures::trie` | Trie-based structures (`SkipTrie`, `YFastTrie`) |
+| `data_structures::internal` | Internal implementation details (marked pointers, collection traits) |
+| `guard` | `Guard` trait for pluggable memory reclamation strategies |
+| `preemptive_synchronization` | Blocking synchronization (`CountdownEvent`, `FutureExtension`) |
+| `common_tests` | Reusable test suites and benchmark utilities |
 
 ## Core Traits
 
-### `SortedCollection<T>`
+### `SortedCollectionInternal<T>` (crate-private)
 
-Low-level trait for sorted collection algorithms:
+Low-level trait for sorted collection algorithms. All methods are `unsafe fn`
+requiring the caller to hold a pinned read guard (`Guard::pin()`):
 
 ```rust
-pub trait SortedCollection<T: Eq + Ord> {
+pub trait SortedCollectionInternal<T: Eq + Ord> {
     type Node: CollectionNode<T>;
     type NodePosition: NodePosition<T, Node = Self::Node>;
 
-    // Core operations (return NodePosition for batch optimization)
-    fn insert_from_internal(&self, key: T, position: Option<&Self::NodePosition>) -> Option<Self::NodePosition>;
-    fn remove_from_internal(&self, position: Option<&Self::NodePosition>, key: &T) -> Option<Self::NodePosition>;
-    fn find_from_internal(&self, position: Option<&Self::NodePosition>, key: &T, exact: bool) -> Option<Self::NodePosition>;
-    fn update_internal(&self, position: Option<&Self::NodePosition>, new_value: T)
-        -> Option<(*mut Self::Node, Self::NodePosition)>;
+    // Core operations — all unsafe, require pinned guard
+    unsafe fn insert_from_internal(&self, key: T, position: Option<&Self::NodePosition>) -> Option<Self::NodePosition>;
+    unsafe fn remove_from_internal(&self, position: Option<&Self::NodePosition>, key: &T) -> Option<Self::NodePosition>;
+    unsafe fn find_from_internal(&self, position: Option<&Self::NodePosition>, key: &T, exact: bool) -> Option<Self::NodePosition>;
 
-    // Batch insert (uses NodePosition for O(1) amortized inserts on sorted data)
-    fn insert_batch<I>(&self, iter: I) -> usize
-    where
-        I: OrderedIterator<Item = T>;
+    // Node-replacement UPDATE — on the core trait since all three sorted
+    // collections implement it (the old separate `NodeReplaceUpdate` trait
+    // existed only while SkipList could not). The replaced node is retired
+    // INTERNALLY by every implementor.
+    unsafe fn update_internal(&self, position: Option<&Self::NodePosition>, new_value: T)
+        -> Option<Self::NodePosition>;
 }
 ```
 
-The `NodePosition` trait stores predecessors at ALL levels, enabling O(1) amortized batch inserts for sorted data (similar to RocksDB's "splice" pattern).
+The safe public API is `SortedCollection<T>`, which pins the guard internally and delegates to the `unsafe` methods. It also provides `insert_batch` which uses `NodePosition` for O(1) amortized inserts on sorted data (similar to RocksDB's "splice" pattern).
 
-The `update_internal` method provides atomic in-place updates using UPDATE_MARK. The key is never "missing" during an update - readers always see either the old or new value.
+Node-replacement UPDATE is `SortedCollectionInternal::update_internal`, implemented by all three sorted collections (it briefly lived on a separate `NodeReplaceUpdate` trait while `SkipList` could not support node replacement; folded back 2026-06-10). A *set* has no separable value, so the public `SortedCollection::update` is a **presence check** (replacing an element with an `Eq` element is a no-op); node-replacement matters for the **maps**. `SkipList` offers both map backends, selected by payload type: `SkipList<MapEntry<K,V>>` updates via a single value-pointer CAS (no `UPDATE_MARK`, value behind one indirection), while `SkipList<Pair<K,V>>` updates by **forward-splice node replacement** — one CAS marks the old carrier and links its same-key replacement, so the key is never absent, the value stays inline in the node, and the old node's teardown reuses the deferred physical-delete handshake. Node-replacement UPDATE is validated **epoch-safe** for all three implementors (EpochGuard + ASan stress; single-level, trie, and multi-level-tower): the old node is provably unreachable before it is retired, and forward iteration skips a node's same-key UPDATE replacement so it never yields a key twice. Retirement is uniform and **internal**: every implementor unlinks AND retires the replaced node itself (`update_internal` returns only the new position) — callers never retire anything.
 
-### `HashMapCollection<K, V>`
+### `MapCollectionInternal<K, V>` / `MapCollection<K, V>`
 
-Low-level trait for hash map algorithms:
+Low-level trait (`MapCollectionInternal`) for key-value map algorithms; the safe `MapCollection` supertrait adds the guard-pinning convenience methods:
 
 ```rust
-pub trait HashMapCollection<K: Hash + Eq, V> {
-    type Node: HashMapNode<K, V>;
+pub trait MapCollectionInternal<K: Eq, V> {
+    type Guard: Guard;
+    type Node: MapNode<K, V>;
 
+    fn guard(&self) -> &Self::Guard;
     fn insert_internal(&self, key: K, value: V) -> Option<*mut Self::Node>;
     fn remove_internal(&self, key: &K) -> Option<*mut Self::Node>;
     fn find_internal(&self, key: &K) -> Option<*mut Self::Node>;
-    fn contains(&self, key: &K) -> bool;
-    fn get(&self, key: &K) -> Option<V> where V: Clone;
+    fn update_internal(&self, key: K, value: V) -> bool; // replace value, retire old internally
+    fn apply_on_internal<F, R>(&self, node: *mut Self::Node, f: F) -> Option<R>;
+    fn len_internal(&self) -> usize;
 }
+
+// The safe `MapCollection<K, V>: MapCollectionInternal<K, V>` supertrait adds the
+// guard-pinning convenience methods: insert, remove, contains, get, update, find_and_apply.
 ```
+
+For maps, **UPDATE is a value-CAS, not node replacement.** The `SkipList` map payload is `MapEntry<K, V>` (key inline + value behind an `AtomicPtr<V>`); `update` CASes the value pointer, then retires the **old value** (not the node) through the guard. The node is never replaced, so the key is never "missing" and there is no old-node reclamation hazard — epoch-safe by construction. The value pointer also carries the entry's **logical presence** (null = tombstone): `remove` linearizes by *claiming* the value (null swap) before physically deleting the node, `update`'s CAS fails on the tombstone, and reads treat null as absent — update↔remove races serialize on one atomic, so a remove always returns the then-current value (no lost updates; `MapCollection::remove` is overridden to return the claimed value). `SkipList<MapEntry<K,V>>` additionally exposes `get_ref(&K) -> Option<GuardedRef<V>>`, a zero-copy guard-protected value read (the map analog of `SortedCollection::find`). Node-replacement maps (`SortedList`/`SkipTrie`/`SplitOrderedHashMap`) retire the old node inside their `update_internal`. Set-API mutation (`SortedCollection::insert/delete`) on a map-typed `SkipList` is **out of contract** — use the `MapCollection` API exclusively.
+
+### Additional Public Traits & Types
+
+| Type / Trait | Module | Description |
+|--------------|--------|-------------|
+| `Guard` | `guard` | Trait for pluggable memory reclamation (epoch, deferred, hazard) |
+| `IterableCollection<T>` | `iterable_collection` | Safe iteration over collections with guarded references |
+| `IterableSortedCollection<T>` | `iterable_collection` | Extended iteration with `iter_from` range queries |
+| `OrderedIterator` | `ordered_iterator` | Marker trait for iterators yielding elements in ascending order |
+| `Ordered<I>` | `ordered_iterator` | Runtime-verified ordered iterator wrapper for batch operations |
+| `Pair<K, V>` | `pair` | Key-value wrapper (compares by key only); map payload for `SortedList` / `SkipTrie` (value stored inline) |
+| `MapEntry<K, V>` | `map_entry` | Map payload for `SkipList` — key inline + value behind `AtomicPtr<V>`, enabling epoch-safe value-CAS UPDATE |
 
 ## Synchronization Primitives
 
@@ -151,41 +191,50 @@ assert_eq!(doubled, Some(10));
 For production use with proper memory reclamation, use `starfish-crossbeam`:
 
 ```rust
-use starfish_crossbeam::EpochGuardedCollection;
+use starfish_crossbeam::EpochGuard;
 use starfish_core::data_structures::sorted_list::SortedList;
+use starfish_core::data_structures::sorted_collection::SortedCollection;
 
-let list = EpochGuardedCollection::new(SortedList::<i32>::new());
+let list: SortedList<i32, EpochGuard> = SortedList::new();
 
 list.insert(5);
 if let Some(val) = list.find(&5) {
     println!("Found: {}", *val);
 }
 
-// Atomic node replacement - key is never "missing" during the update
-list.update(5);  // Atomically replaces the node containing 5
+// For a set, update(5) confirms 5 is present (replacing an element with an
+// equal element is a no-op). Key->value maps update via value-CAS — the map
+// payload is `MapEntry`, and `SkipList::get_ref` reads a value without cloning.
+list.update(5);
 
 list.delete(&5);
 ```
 
 ## Testing
 
-The crate includes a comprehensive test framework for sorted collections:
+The crate includes reusable test frameworks for both `SortedCollection` and `MapCollection`:
 
 ```rust
 use starfish_core::common_tests::sorted_collection_core_tests;
+use starfish_core::common_tests::map_collection_core_tests;
 
-// Run standard test suite on your implementation
+// Run standard SortedCollection test suite
 sorted_collection_core_tests::test_basic_operations::<MyCollection>();
 sorted_collection_core_tests::test_concurrent_operations::<MyCollection>();
-sorted_collection_core_tests::test_concurrent_mixed_operations::<MyCollection>();
+
+// Run MapCollection test suite
+map_collection_core_tests::test_insert_contains_get::<MyMap>();
+map_collection_core_tests::test_concurrent_insert_get_remove::<MyMap>();
 ```
 
-Enable the test framework feature:
+Enable the test framework features:
 
 ```toml
 [features]
-default = ["sorted_collection_core_tests"]
+default = ["sorted_collection_core_tests", "map_collection_core_tests"]
 ```
+
+The optional `bench_utils` feature provides shared benchmark helpers (e.g., dynamic thread-count generation) used across `starfish-crossbeam` benchmarks.
 
 ## Benchmarks
 
@@ -208,10 +257,10 @@ cargo bench --bench concurrent_benchmark
 
 The low-level data structures (`SortedList`, `SkipList`, etc.) intentionally leak memory - deleted nodes are unlinked but not freed. This design enables lock-free deletion without use-after-free bugs.
 
-For automatic memory reclamation, wrap collections with:
-- `EpochGuardedCollection` (recommended) - Uses epoch-based reclamation
-- `HazardPointerCollection` - Uses hazard pointers
-- `DeferredCollection` - Defers destruction until drop (testing only)
+For automatic memory reclamation, parameterize collections with a `Guard` type:
+- `SkipList<T, EpochGuard>` (recommended) - Uses epoch-based reclamation via crossbeam
+- `SortedList<T, EpochGuard>` - Same, for linked lists
+- `SortedList<T, DeferredGuard>` - Defers destruction until guard drops (testing only)
 
 ## Algorithm Invariants
 
@@ -226,7 +275,7 @@ The library uses two mark bits in pointer LSBs for lock-free coordination:
 
 ### Critical Traversal Invariant
 
-**All traversal code MUST use `is_any_marked()` (not `is_marked()`) when checking if a node needs unlinking.**
+**All traversal code MUST use `is_any_marked()` (not `is_delete_marked()`) when checking if a node needs unlinking.**
 
 ```rust
 // CORRECT - handles both DELETE and UPDATE marks
@@ -235,7 +284,7 @@ if next_marked.is_any_marked() {
 }
 
 // WRONG - only handles DELETE mark, causes livelock with UPDATE
-if next_marked.is_marked() {  // DON'T DO THIS
+if next_marked.is_delete_marked() {  // DON'T DO THIS
     // ...
 }
 ```
@@ -245,6 +294,11 @@ When a node is marked (either DELETE or UPDATE), traversing threads help by phys
 - **UPDATE-marked**: Snip to `node.next` (the replacement node B')
 
 Failing to handle UPDATE-marked nodes causes livelock under concurrent updates.
+
+> Scope note: since the value-CAS redesign, `UPDATE_MARK` is produced **only** by the
+> node-replacement UPDATE of `SortedList`/`SkipTrie`. `SkipList` maps update via value-CAS and
+> never set `UPDATE_MARK`; SkipList traversal still tolerates the mark defensively (dead but
+> harmless), so the `is_any_marked()` rule above still holds for all structures.
 
 ### Epoch Guard Requirements
 
@@ -261,20 +315,21 @@ fn insert(&self, key: T) -> bool {
     // MUST pin epoch guard! Insert traverses the list via find_position,
     // which accesses existing nodes that could be freed by concurrent deletes.
     let _guard = epoch::pin();
-    self.inner.insert_from_internal(key, None).is_some()
+    // SAFETY: guard pinned above protects against concurrent reclamation.
+    unsafe { self.inner.insert_from_internal(key, None) }.is_some()
 }
 ```
 
 Operations requiring epoch guards:
 - `insert`, `insert_from`, `insert_batch` - traverse to find insertion point
 - `delete`, `remove` - traverse to find and unlink target
-- `update` - traverse to find, replace, and unlink
-- `find`, `contains`, `find_and_apply` - traverse to locate target
+- `update` - SkipList map: traverse to find, then value-CAS (no unlink); SortedList/SkipTrie: traverse, replace, unlink; SkipList set: presence check
+- `find`, `contains`, `find_and_apply`, `get_ref` - traverse to locate target
 - `is_empty`, `iter`, `iter_from` - access list nodes
 
 ### Node Removal Requirements for Epoch Guard
 
-**Old nodes returned from `update_internal` and `remove_internal` MUST be physically unlinked from the list before the function returns.**
+**A replaced or removed node MUST be physically unlinked before it is retired.** `update_internal` enforces this internally for all implementors (the old node is unlinked, then `defer_destroy`'d by the collection itself); `remove_internal` likewise must unlink before the node is retired (SortedList/SkipTrie: caller retires the returned node; SkipList: retirement is internal to the physical-phase winner). The `SkipList<MapEntry>` map `update` is a value-CAS that retires the old *value*, not a node, so it has nothing to unlink.
 
 This is critical for epoch-based memory reclamation:
 
@@ -283,7 +338,7 @@ This is critical for epoch-based memory reclamation:
 3. If the node remains linked, concurrent readers may access it after destruction → **use-after-free**
 
 ```rust
-// update_internal returns the OLD node for destruction
+// Node-replacement update_internal (SortedList/SkipTrie) returns the OLD node
 fn update_internal(...) -> Option<(*mut Self::Node, Self::NodePosition)> {
     // ... mark old_node with UPDATE_MARK ...
     // ... unlink old_node from ALL levels ...
@@ -391,29 +446,43 @@ if result.is_err() && is_marked(result) {
 }
 ```
 
-### Update Algorithm (UPDATE_MARK)
+### Update Algorithm
 
-The atomic update algorithm ensures keys are never "missing" during updates:
+**SkipList maps — value-CAS (epoch-safe).** The `MapEntry<K,V>` payload holds the value behind an
+`AtomicPtr<V>`. UPDATE swaps the value pointer with a single CAS and retires the **old value**
+through the guard. The node is never touched, so the key is never "missing" and there is no
+old-node reclamation hazard:
+
+```
+update(K, v'):  p = node.value.swap(into_raw(v'))   // single CAS — linearization point
+                guard.defer_destroy(p)               // retire the OLD value (refcount-free)
+```
+
+`get_ref(&K)` reads a value without cloning: it hands the value pointer to `Guard::make_ref`,
+returning a `GuardedRef<V>` whose own pinned guard keeps the value alive while held.
+
+**SortedList / SkipTrie — node-replacement (Mark-and-Append).** These still replace the node: a
+same-key node `B'` is appended after the matched node `B`, predecessors are relinked to `B'`, and
+`B` is unlinked and deferred:
 
 ```
 Before:  pred → B → succ
-                ↓
-Step 1:  pred → B(UPD→B') → succ    (CAS B.next[0] = B'|UPDATE_MARK)
-                ↓
-Step 2:  Mark B.next[1..height] = B'|UPDATE_MARK (all levels point to B'!)
-                ↓
-Step 3:  pred → B' → succ              (Unlink B from all levels)
+Step 1:  pred → B ──╳U──► B' → succ   (CAS B.next[0]: succ → B'|UPDATE_MARK; linearization point)
+Step 2:  relink predecessors → B'
+Step 3:  pred → B' → succ              (unlink B; B orphaned, deferred free)
 ```
 
-- **Linearization point**: CAS that sets `B.next[0] = B' | UPDATE_MARK`
-- Readers seeing UPDATE_MARK follow the pointer to find B' (the new value)
-- Traversing threads help unlink B when they encounter the UPDATE_MARK
+- Readers seeing `UPDATE_MARK` follow the pointer to `B'` (the new value); traversing threads help
+  unlink `B`. This is why all traversal uses `is_any_marked()` (see above).
+- The replacement `B'` is allocated at the same height as `B` to preserve structure.
 
-**Critical Invariants**:
-1. The new node B' MUST have the SAME HEIGHT as B (preserves skip list balance)
-2. At ALL levels, `B.next[level] = B' | UPDATE_MARK` (not succ!)
-   - If we marked with succ, find_at_level would snip to succ, bypassing B'
-   - This would break the skip list structure and cause hangs/cycles
+> Node-replacement UPDATE was **removed from SkipList** specifically: its *helping* variant could
+> `defer_destroy` the old node while a concurrent traversal still reached it (use-after-free,
+> reproduced with EpochGuard + ASan). `SortedList`/`SkipTrie` use non-helping mark-then-insert with
+> a guaranteed unlink-before-retire and are **validated epoch-safe** (EpochGuard + ASan,
+> `starfish-crossbeam/tests/{sorted_list,skip_trie}_map_epoch.rs`); their iterators skip a node's
+> same-key UPDATE replacement, so iteration is duplicate-free. They keep node-replacement; value-CAS
+> is preferred only for its single-CAS UPDATE and for letting `UPDATE_MARK` eventually be removed.
 
 ### Recovery from Marked Predecessors
 

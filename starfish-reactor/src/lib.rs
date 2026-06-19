@@ -1,5 +1,12 @@
+//! Cross-platform async I/O reactor and cooperative task scheduler.
+//!
+//! This crate provides `Reactor` for single-threaded cooperative scheduling of futures,
+//! `Coordinator` for multi-reactor orchestration, and platform-specific async I/O
+//! backends (io_uring on Linux, kqueue on macOS, IOCP on Windows).
+
 #![allow(dead_code)]
 
+pub(crate) mod completion_signaler;
 pub mod cooperative_io;
 pub mod cooperative_synchronization;
 pub mod coordinator;

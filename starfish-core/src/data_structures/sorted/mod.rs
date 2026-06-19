@@ -10,6 +10,10 @@ pub mod skip_list;
 pub mod sorted_list;
 pub mod treap;
 
+// load_consume and prefetch_read live in internal::atomic_ptr (shared with trie).
+pub(crate) use super::internal::load_consume;
+pub(crate) use super::internal::prefetch_read;
+
 pub use skip_list::{SkipList, SkipNodePosition};
 pub use sorted_list::{ListNodePosition, SortedList};
 pub use treap::Treap;

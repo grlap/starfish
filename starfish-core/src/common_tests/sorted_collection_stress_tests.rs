@@ -7,7 +7,15 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::data_structures::SortedCollection;
+use crate::data_structures::{Ordered, SortedCollection};
+
+#[inline]
+fn max_threads() -> usize {
+    thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(32)
+}
 
 /// Test concurrent find operations during modifications
 pub fn test_find_during_modifications<C>()
@@ -118,7 +126,7 @@ where
     C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
-    let num_threads = 100;
+    let num_threads = max_threads();
     let test_value = 42;
 
     collection.insert(test_value);
@@ -158,9 +166,7 @@ where
     C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
-    let num_threads = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
+    let num_threads = max_threads();
     let num_ops = 10000;
 
     let handles: Vec<_> = (0..num_threads)
@@ -204,9 +210,7 @@ where
     C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
-    let num_threads = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
+    let num_threads = max_threads();
 
     let progress_counters: Vec<_> = (0..num_threads)
         .map(|_| Arc::new(AtomicUsize::new(0)))
@@ -277,7 +281,7 @@ where
     C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
-    let num_threads = 100;
+    let num_threads = max_threads();
     let ops_per_thread = 1000;
     let the_key = 42;
 
@@ -330,7 +334,7 @@ where
     C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
-    let num_threads = 32;
+    let num_threads = max_threads();
     let range_size = 100i32;
 
     // Pre-populate with sparse data
@@ -342,7 +346,7 @@ where
         .map(|t| {
             let coll = Arc::clone(&collection);
             thread::spawn(move || {
-                let start = (t * 50) % 900;
+                let start = ((t as i32) * 50) % 900;
 
                 for _ in 0..10000 {
                     // Find all in range
@@ -362,7 +366,7 @@ where
 
                     // Insert new ones in gaps
                     for i in start..start + range_size {
-                        if i % 7 == t % 7 {
+                        if i % 7 == (t as i32) % 7 {
                             coll.insert(i);
                         }
                     }
@@ -384,7 +388,7 @@ where
     C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
-    let num_threads = 64;
+    let num_threads = max_threads();
     let duration = Duration::from_secs(3);
     let stop = Arc::new(AtomicBool::new(false));
     let ops_count = Arc::new(AtomicUsize::new(0));
@@ -445,7 +449,7 @@ where
     C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
-    let num_threads = 32;
+    let num_threads = max_threads();
     let iterations = 10000;
     let key_range = 10i32; // Small range to force contention
 
@@ -454,7 +458,7 @@ where
             let coll = Arc::clone(&collection);
             thread::spawn(move || {
                 for i in 0..iterations {
-                    let key = (t + i) % key_range;
+                    let key = ((t as i32) + i) % key_range;
 
                     // Rapid succession of operations on same key
                     coll.insert(key);
@@ -486,7 +490,7 @@ where
     C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
-    let num_threads = 16;
+    let num_threads = max_threads();
     let iterations_per_thread = 50000;
 
     // Pre-insert keys - each key will be rapidly updated by all threads
@@ -510,7 +514,7 @@ where
 
                 for i in 0..iterations_per_thread {
                     // Each thread updates different keys in rotation
-                    // For sorted SET, update replaces the node with an equal value (atomic node replacement)
+                    // For a set, `update` is a presence check (no value to replace) — succeeds iff present
                     let key = ((t + i) as i32) % key_range;
 
                     if coll.update(key) {
@@ -533,10 +537,9 @@ where
         total_updates
     );
 
-    // With sorted sets, update(old_key, new_value) changes the key position,
-    // so high contention means many updates fail as keys move around.
-    // The main goal is that this test completes without livelock.
-    // Any successful updates means progress was made.
+    // A set `update` is a presence check (no value to replace): it succeeds for any
+    // present key. The main goal is that this test completes without livelock and makes
+    // progress.
     assert!(
         total_updates > 0,
         "No updates succeeded - possible livelock"
@@ -551,7 +554,7 @@ where
     C: SortedCollection<i32> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
-    let num_threads = 16;
+    let num_threads = max_threads();
     let iterations_per_thread = 500_000;
 
     // Pre-insert keys 1 to 10
@@ -574,7 +577,7 @@ where
                 barrier.wait();
 
                 for _ in 0..iterations_per_thread {
-                    // All threads update key 5 (atomic node replacement)
+                    // All threads update key 5 (a set update is a presence check)
                     if coll.update(5) {
                         success.fetch_add(1, Ordering::Relaxed);
                     } else {
@@ -700,7 +703,7 @@ where
     C: SortedCollection<i64> + Default + Send + Sync + 'static,
 {
     let collection = Arc::new(C::default());
-    let thread_count = 16;
+    let thread_count = max_threads();
     let ops_per_thread = 1000;
     let key_range = 50i64; // Small range for high contention
 
@@ -787,5 +790,86 @@ where
         for handle in handles {
             handle.join().unwrap();
         }
+    }
+}
+
+/// Test insert_batch under concurrent modification.
+///
+/// One thread performs a large sorted batch insert (exercising position hint
+/// threading), while other threads concurrently insert and delete overlapping
+/// keys. This stresses the hint validation logic in `find_position_from` —
+/// hints may point to marked (deleted) nodes or nodes whose key ordering is
+/// invalidated by concurrent inserts, requiring fallback to full traversal.
+pub fn test_insert_batch_during_concurrent_modifications<C>()
+where
+    C: SortedCollection<i32> + Default + Send + Sync + 'static,
+{
+    let collection = Arc::new(C::default());
+    let barrier = Arc::new(Barrier::new(5)); // 1 batch + 4 modifier threads
+
+    // Pre-populate with even numbers 0..2000
+    for i in 0..1000 {
+        collection.insert(i * 2);
+    }
+
+    let mut handles = vec![];
+
+    // 4 modifier threads: insert and delete EVEN numbers only.
+    // This creates structural contention (tower overlaps at higher skip list levels)
+    // without deleting the odd keys that the batch thread inserts.
+    for t in 0..4u32 {
+        let coll = Arc::clone(&collection);
+        let bar = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            bar.wait();
+            let base = (t as i32) * 500;
+            for round in 0..20 {
+                for i in 0..250 {
+                    // Only even keys — disjoint from batch's odd keys
+                    let key = base + i * 2;
+                    if round % 2 == 0 {
+                        coll.insert(key);
+                    } else {
+                        coll.delete(&key);
+                    }
+                }
+            }
+        }));
+    }
+
+    // 1 batch-insert thread: insert odd numbers 1,3,5,...,1999 in sorted order
+    let coll = Arc::clone(&collection);
+    let bar = Arc::clone(&barrier);
+    handles.push(thread::spawn(move || {
+        bar.wait();
+        let data: Vec<i32> = (0..1000).map(|i| i * 2 + 1).collect();
+        let ordered = Ordered::new(data.into_iter());
+        let inserted = coll.insert_batch(ordered);
+        assert_eq!(inserted, 1000, "all odd keys should be new");
+    }));
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    // Verify structural integrity: to_vec must be sorted
+    let items = collection.to_vec();
+    for window in items.windows(2) {
+        assert!(
+            window[0] < window[1],
+            "to_vec not sorted: {} >= {}",
+            window[0],
+            window[1]
+        );
+    }
+
+    // All odd numbers from the batch must be present — modifiers never touch odd keys
+    for i in 0..1000 {
+        let odd = i * 2 + 1;
+        assert!(
+            collection.contains(&odd),
+            "Batch-inserted key {} missing after concurrent modifications",
+            odd
+        );
     }
 }

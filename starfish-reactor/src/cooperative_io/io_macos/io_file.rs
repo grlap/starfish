@@ -1,3 +1,8 @@
+//! macOS file I/O via kqueue event notifications.
+//!
+//! Implements async file read and write by registering kqueue events on file
+//! descriptors, performing non-blocking I/O when readiness is signaled.
+
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
@@ -29,8 +34,20 @@ pub(crate) fn prepare_io_with_file(_: &File) -> Result<(), io::Error> {
     Ok(())
 }
 
-pub async fn read_file(
+/// Zero-sized stub of the file-position contract (`cooperative_io/file.rs`):
+/// the kqueue backend uses plain `read(2)`/`write(2)` cursor syscalls, so the
+/// kernel file position already provides the contract.
+pub(crate) struct FilePosition;
+
+impl FilePosition {
+    pub(crate) fn new() -> Self {
+        FilePosition
+    }
+}
+
+pub(crate) async fn read_file(
     file: &mut File,
+    _: &mut FilePosition,
     buf: &mut [u8],
     timeout: &Option<IOTimeout>,
 ) -> io::Result<usize> {
@@ -73,8 +90,9 @@ pub async fn read_file(
     pinned_io_wait_future.await
 }
 
-pub async fn write_file(
+pub(crate) async fn write_file(
     file: &mut File,
+    _: &mut FilePosition,
     buf: &[u8],
     timeout: &Option<IOTimeout>,
 ) -> io::Result<usize> {

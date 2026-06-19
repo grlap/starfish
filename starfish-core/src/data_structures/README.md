@@ -13,34 +13,35 @@ Both sorted collections and hash maps follow the same pattern:
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │   ┌─────────────────────────────┐     ┌─────────────────────────────┐   │
-│   │   EpochGuardedCollection    │     │    EpochGuardedHashMap      │   │
-│   │        (struct)             │     │        (struct)             │   │
+│   │ SkipList<T, EpochGuard>     │     │ SplitOrderedHashMap<K,V,EG> │   │
+│   │     (parameterized)         │     │     (parameterized)         │   │
 │   │   [starfish-crossbeam]      │     │   [starfish-crossbeam]      │   │
 │   │                             │     │                             │   │
 │   │  • insert(T)                │     │  • insert(K, V)             │   │
+│   │                             │     │  • update(K, V)             │   │
 │   │  • delete(&T)               │     │  • remove(&K) -> V          │   │
-│   │  • find(&T) -> GuardRef     │     │  • get(&K) -> GuardRef      │   │
+│   │  • find(&T) -> CollRef      │     │  • get(&K) -> Option<V>     │   │
 │   │  • contains(&T)             │     │  • contains(&K)             │   │
 │   │  • update(T)                │     │  • find_and_apply(...)      │   │
 │   │  • Epoch-based reclamation  │     │  • Epoch-based reclamation  │   │
 │   └─────────────┬───────────────┘     └─────────────┬───────────────┘   │
 │                 │                                   │                   │
 └─────────────────┼───────────────────────────────────┼───────────────────┘
-                  │ wraps                             │ wraps
+                  │ Guard param                       │ Guard param
                   ▼                                   ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                      LOW-LEVEL TRAITS                                   │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │   ┌─────────────────────────┐         ┌─────────────────────────┐       │
-│   │    SortedCollection     │         │   HashMapCollection     │       │
+│   │    SortedCollection     │         │     MapCollection       │       │
 │   │        (trait)          │         │        (trait)          │       │
 │   │                         │         │                         │       │
 │   │  • insert_from_internal │         │  • insert_internal      │       │
 │   │  • remove_from_internal │         │  • remove_internal      │       │
 │   │  • find_from_internal   │         │  • find_internal        │       │
-│   │  • update_internal      │         │  • apply_on_internal    │       │
-│   │                         │         │                         │       │
+│   │  • update_internal      │         │  • update_internal      │       │
+│   │                         │         │  • apply_on_internal    │       │
 │   │  Returns: *mut Node     │         │  Returns: *mut Node     │       │
 │   │  (raw pointers!)        │         │  (raw pointers!)        │       │
 │   └───────────┬─────────────┘         └───────────┬─────────────┘       │
@@ -65,27 +66,26 @@ Both sorted collections and hash maps follow the same pattern:
 
 ### Key Design Principles
 
-1. **Users interact with EpochGuardedCollection/HashMap** - no raw pointers exposed
-2. **Memory-safe wrappers** convert unsafe internal operations to safe APIs
-3. **GuardedRef** bundles epoch guards with references to prevent use-after-free
-4. **Two wrapper options**:
-   - `EpochGuardedCollection/HashMap` - production use with proper reclamation
-   - `DeferredCollection/HashMap` - testing only, defers cleanup until drop
+1. **Users parameterize collections with a Guard type** (e.g. `EpochGuard`) - no raw pointers exposed
+2. **Guard implementations** convert unsafe internal operations to safe APIs
+3. **CollectionRef** bundles epoch guards with references to prevent use-after-free
+4. **Two guard options**:
+   - `EpochGuard` (starfish-crossbeam) - production use with epoch-based reclamation
+   - `DeferredGuard` - testing only, defers cleanup until guard drops
 
 ### Quick Usage
 
 ```rust
 // PRODUCTION: Sorted collection with epoch-based reclamation
-let list = EpochGuardedCollection::new(SkipList::new());
+let list: SkipList<i32, EpochGuard> = SkipList::new();
 list.insert(42);
 
 // PRODUCTION: Hash map with epoch-based reclamation
-let map = EpochGuardedHashMap::new(SplitOrderedHashMap::new());
+let map: SplitOrderedHashMap<&str, &str, EpochGuard> = SplitOrderedHashMap::new();
 map.insert("key", "value");
 
 // TESTING: Deferred cleanup (for predictable test behavior)
-let list = DeferredCollection::new(SortedList::new());
-let map = DeferredHashMap::new(SplitOrderedHashMap::new());
+let list: SortedList<i32, DeferredGuard> = SortedList::new();
 ```
 
 ## Trait Hierarchy
@@ -95,7 +95,7 @@ let map = DeferredHashMap::new(SplitOrderedHashMap::new());
 The `SortedCollection` trait defines the low-level algorithm interface. It exposes raw pointers and is not meant for direct use by application code.
 
 ```rust
-pub trait SortedCollection<T: Eq + Ord> {
+pub trait SortedCollectionInternal<T: Eq + Ord> {
     type Node: CollectionNode<T>;
     type NodePosition: NodePosition<T, Node = Self::Node>;
 
@@ -103,8 +103,11 @@ pub trait SortedCollection<T: Eq + Ord> {
     fn insert_from_internal(&self, key: T, position: Option<&Self::NodePosition>) -> Option<Self::NodePosition>;
     fn remove_from_internal(&self, position: Option<&Self::NodePosition>, key: &T) -> Option<Self::NodePosition>;
     fn find_from_internal(&self, position: Option<&Self::NodePosition>, key: &T, exact: bool) -> Option<Self::NodePosition>;
-    fn update_internal(&self, position: Option<&Self::NodePosition>, new_value: T)
-        -> Option<(*mut Self::Node, Self::NodePosition)>;
+    // Node-replacement update: one CAS marks the old node UPDATE and links its
+    // same-key replacement (key never absent); the replaced node is retired
+    // INTERNALLY by every implementor. (A set's public `update` remains a
+    // presence check; SkipList<MapEntry> maps use value-CAS instead.)
+    fn update_internal(&self, position: Option<&Self::NodePosition>, new_value: T) -> Option<Self::NodePosition>;
 
     // Iteration support
     fn first_node_internal(&self) -> Option<*mut Self::Node>;
@@ -123,9 +126,37 @@ pub trait SortedCollection<T: Eq + Ord> {
 The `NodePosition` trait stores predecessors at ALL levels, enabling O(1) amortized batch inserts
 for sorted data. This optimization is similar to RocksDB's "splice" pattern for MemTable inserts.
 
-### Atomic Update Operation (UPDATE_MARK)
+### Update Operations
 
-The `update_internal` method provides atomic in-place updates using marked pointers.
+There are two UPDATE mechanisms:
+
+- **Value-CAS (SkipList maps):** the `MapEntry<K,V>` payload holds the value behind an
+  `AtomicPtr<V>`; `update` CASes the value pointer and retires the old *value* through the guard.
+  The node is never replaced — so UPDATE is a single CAS and there is no `UPDATE_MARK`. The value
+  pointer also carries the entry's logical presence (null = **tombstone**): `remove` linearizes by
+  CLAIMING the value (null swap) before physically deleting the node, and `update`'s CAS fails on
+  the tombstone — so update↔remove races serialize on one atomic and a remove always returns the
+  then-current value (no lost updates). Reads treat null as absent; `insert` HELPS finish a
+  tombstoned duplicate's physical delete and retries (it never waits on the remover — SkipList
+  operations never spin on another thread's progress; presence is decided by the level-0 mark
+  alone, and a delete that lands on a still-linking node defers its physical phase to the
+  inserter via the `linked_height` RMW handshake).
+- **Node-replacement (SortedList/SkipTrie/SkipList, via `SortedCollectionInternal::update_internal`):**
+  replace the matched node with a new one using `UPDATE_MARK`, then unlink the old node — described
+  below. This path is **validated epoch-safe** (EpochGuard + ASan; single-level, trie, and
+  multi-level skip-list towers): the old node is provably unreachable before retire, and forward
+  iteration skips a node's same-key UPDATE replacement (`next_node_internal`), so it is
+  **duplicate-free**. `SkipList<Pair<K,V>>` (restored 2026-06-10) keeps the value INLINE in the
+  node and runs the old node's teardown through the deferred physical-delete handshake — the key is
+  never absent during an update, no operation waits on any other thread, and update↔remove
+  serialize on the carrier's level-0 next pointer (splice CAS vs DELETE mark), so a remove always
+  returns the then-current value. Retirement of the replaced
+  node is INTERNAL for every implementor (uniform contract; `update_internal` returns only the
+  new position). (The ORIGINAL SkipList
+  node-replacement was removed because its *helping* variant could not guarantee
+  unlink-before-retire; the restored design needs no update-side helping.)
+
+The node-replacement algorithm uses marked pointers:
 
 **Key Guarantees:**
 - `find_from_internal` only returns nodes available in the current epoch (unmarked nodes)
@@ -147,10 +178,11 @@ The `update_internal` method provides atomic in-place updates using marked point
 - Marked nodes are fully unlinked before the function returns
 
 **Implementation Status:**
-| Implementation | update_internal |
-|----------------|-----------------|
-| SortedList | ✅ Atomic UPDATE_MARK (forward insertion) |
-| SkipList | ✅ Atomic UPDATE_MARK (forward insertion) |
+| Implementation | map UPDATE mechanism |
+|----------------|----------------------|
+| SortedList | ✅ Node-replacement via `UPDATE_MARK` (forward insertion) |
+| SkipTrie | ✅ Node-replacement via `UPDATE_MARK` (forward insertion) |
+| SkipList | ✅ BOTH: node-replacement via `UPDATE_MARK` (`Pair` payload, inline values) or value-CAS (`MapEntry` payload; no `UPDATE_MARK`) |
 
 ### Insert-or-Update Pattern (SplitOrderedHashMap)
 
@@ -192,11 +224,13 @@ fn insert(&self, key: K, value: V) -> Option<V> {
 1. **Optimistic Fast Path**: Most inserts are for new keys. Attempting insert first
    avoids the overhead of searching for existing keys when they don't exist.
 
-2. **Atomic Updates**: When a key exists, `update_internal` atomically replaces the
-   old value. Readers always see either the old or new value, never a "missing" key.
+2. **Atomic Updates**: When a key exists, `update_internal` updates the value in place
+   (value-CAS for SkipList maps; node-replacement for SortedList/SkipTrie). Readers always
+   see either the old or new value, never a "missing" key.
 
-3. **Race Handling**: If another thread deletes the key between the failed insert
-   and the update attempt, `update_internal` returns `None`, and we retry the insert.
+3. **Race Handling**: `MapCollectionInternal::update_internal` now returns `bool` (`true` if
+   the key existed). If another thread deleted the key, it returns `false`, and we retry the
+   insert. (The code sketch above predates the `-> bool` change — see `map_collection.rs`.)
 
 **Comparison with DELETE + INSERT:**
 
@@ -249,7 +283,7 @@ Level 0:  Head ──► [1] ──► [2] ──► [3] ──► [4] ──►
 
 **Characteristics:**
 - O(log n) average for search, insert, delete
-- Probabilistic balancing (16 levels, p=0.5)
+- Probabilistic balancing (32 levels, p=0.5)
 - Forward-only traversal
 - **Batch insert optimization**: ~5-15% faster for sorted batch inserts
 - **Best-effort higher levels**: Level 0 is critical; levels 1+ break on CAS failure (elegant design)
@@ -279,7 +313,7 @@ When finding predecessors to delete node X:
 
 **Characteristics:**
 - O(log n) operations (insert, delete, find, update)
-- 16 levels with p=0.5 probability
+- 32 levels with p=0.5 probability
 - Level-based recovery using preds[level+1] (memory efficient, no prev pointers)
 - **Batch insert optimization**: ~10-17% faster for sorted batch inserts
 - **Best-effort higher levels**: Level 0 is critical; levels 1+ break on CAS failure
@@ -490,31 +524,33 @@ Note: SortedList batch insert transforms O(n²) → O(n), while SkipList stays O
 
 ## Memory Safety Wrappers
 
-### DeferredCollection
+### DeferredGuard
 
-Defers node destruction until the collection is dropped. Useful for testing where you want predictable cleanup timing.
+A `Guard` implementation that collects freed node pointers and deallocates them
+when the guard is dropped. Useful for testing where you want predictable cleanup timing.
 
 ```
-┌─────────────────────────────────────────┐
-│          DeferredCollection             │
-│  ┌───────────────┐  ┌────────────────┐  │
-│  │    inner      │  │ deferred_nodes │  │
-│  │ (collection)  │  │    (Vec)       │  │
-│  └───────────────┘  └────────────────┘  │
-│         │                   │           │
-│         ▼                   ▼           │
-│    SortedList         [ptr, ptr, ...]   │
-│    or SkipList        (freed on drop)   │
-└─────────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│    SortedList<T, DeferredGuard>              │
+│  ┌───────────────┐  ┌─────────────────────┐  │
+│  │   list data   │  │   DeferredGuard     │  │
+│  │  (nodes)      │  │  deferred_nodes     │  │
+│  └───────────────┘  │  (Mutex<HashSet>)   │  │
+│                      └─────────────────────┘  │
+│                              │                │
+│                              ▼                │
+│                      [ptr, ptr, ...]          │
+│                      (freed on guard drop)    │
+└──────────────────────────────────────────────┘
 ```
 
-### EpochGuardedCollection
+### EpochGuard Integration
 
 Uses crossbeam-epoch for safe memory reclamation in concurrent scenarios.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│              EpochGuardedCollection                     │
+│           Collection<T, EpochGuard>                     │
 │  ┌───────────────┐                                      │
 │  │    inner      │                                      │
 │  │ (collection)  │                                      │
@@ -572,9 +608,11 @@ data_structures/
 ├── README.md                      # This file
 ├── iterable_collection.rs         # IterableCollection traits
 ├── ordered_iterator.rs            # OrderedIterator for batch operations
+├── pair.rs                        # Pair<K,V> key-value wrapper (Ord by key only)
 │
 ├── internal/                      # Internal implementation details
 │   ├── mod.rs
+│   ├── atomic_ptr.rs              # load_consume, prefetch_read utilities
 │   ├── marked_ptr.rs              # MarkedPtr (2-bit) for lock-free deletion
 │   ├── marked_ptr_3bit.rs         # MarkedPtr (3-bit) for DELETE/UPDATE/DEL_NEXT
 │   └── sorted_collection.rs       # SortedCollection trait
@@ -588,17 +626,18 @@ data_structures/
 ├── hash/                          # Hash-based collections
 │   ├── mod.rs
 │   ├── split_ordered_hash_map.rs  # Split-ordered hash map
-│   └── hash_map_collection.rs     # HashMapCollection trait (low-level)
+│   └── map_collection.rs          # MapCollection trait (low-level)
 │
 └── trie/                          # Trie implementations
     ├── mod.rs
-    └── skip_trie.rs               # SkipTrie implementation
+    ├── skip_trie.rs               # SkipTrie (x-fast trie + skip list buckets)
+    └── y_fast_trie.rs             # YFastTrie (sorted-bucket partitioning)
 ```
 
 **In starfish-crossbeam:**
 ```
 starfish-crossbeam/src/
-├── lib.rs                         # EpochGuardedCollection, EpochGuardedHashMap
+├── lib.rs                         # EpochGuard re-export
 └── epoch_guard.rs                 # EpochGuard implementation
 ```
 
@@ -607,58 +646,61 @@ starfish-crossbeam/src/
 ### Sorted Collections
 
 ```rust
-use starfish_crossbeam::EpochGuardedCollection;
+use starfish_crossbeam::EpochGuard;
 use starfish_core::data_structures::SkipList;
+use starfish_core::data_structures::sorted_collection::SortedCollection;
 
 // Create a thread-safe sorted collection
-let collection: EpochGuardedCollection<i32, SkipList<i32>> =
-    EpochGuardedCollection::default();
+let list: SkipList<i32, EpochGuard> = SkipList::new();
 
 // Insert values
-collection.insert(5);
-collection.insert(3);
-collection.insert(7);
+list.insert(5);
+list.insert(3);
+list.insert(7);
 
 // Safe iteration
-for item in collection.iter() {
+for item in list.iter() {
     println!("{}", *item);  // 3, 5, 7
 }
 
 // Range iteration
-for item in collection.iter_from(&5) {
+for item in list.range(5..) {
     println!("{}", *item);  // 5, 7
 }
 
 // Find with guarded reference
-if let Some(val) = collection.find(&5) {
+if let Some(val) = list.find(&5) {
     println!("Found: {}", *val);
 }
 
 // Atomic update (replace value, readers never see "missing")
-collection.update(5);  // Replace 5 with 5 atomically
+list.update(5);  // Replace 5 with 5 atomically
 ```
 
 ### Hash Maps
 
 ```rust
-use starfish_crossbeam::EpochGuardedHashMap;
+use starfish_crossbeam::EpochGuard;
 use starfish_core::data_structures::SplitOrderedHashMap;
+use starfish_core::data_structures::hash::map_collection::MapCollection;
 
 // Create a thread-safe hash map
-let map: EpochGuardedHashMap<String, i32, SplitOrderedHashMap<String, i32>> =
-    EpochGuardedHashMap::default();
+let map: SplitOrderedHashMap<String, i32, EpochGuard> = SplitOrderedHashMap::new();
 
 // Insert key-value pairs
 map.insert("alice".to_string(), 100);
 map.insert("bob".to_string(), 200);
 
-// Get with guarded reference
+// Get value
 if let Some(val) = map.get(&"alice".to_string()) {
-    println!("Alice's score: {}", *val);  // 100
+    println!("Alice's score: {}", val);  // 100
 }
 
 // Check existence
 assert!(map.contains(&"bob".to_string()));
+
+// Atomic update (key is never "missing" during update)
+map.update("alice".to_string(), 150);
 
 // Remove and get value
 let removed = map.remove(&"bob".to_string());
@@ -671,7 +713,7 @@ assert_eq!(doubled, Some(200));
 
 ## Design Rationale
 
-1. **Separation of Concerns**: Low-level algorithms (`SortedCollection`) are separate from memory-safe wrappers (`EpochGuardedCollection`), allowing different reclamation strategies.
+1. **Separation of Concerns**: Low-level algorithms (`SortedCollection`) are separate from memory safety (`Guard` trait), allowing different reclamation strategies.
 
 2. **Encapsulation**: Internal node pointers are never exposed to users. The `inner()` method is `pub(crate)` only.
 

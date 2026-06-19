@@ -1,3 +1,9 @@
+//! Polling-based fallback I/O manager for Windows.
+//!
+//! Provides `PoolingIOManager`, which polls pending I/O futures for completion
+//! rather than relying on IOCP notifications. Used as a fallback when IOCP
+//! association is not available for a given handle.
+
 use std::{cell::RefCell, collections::VecDeque, io};
 
 use windows::Win32::System::IO::CancelIoEx;
@@ -18,7 +24,7 @@ use super::io_wait_future::IOWaitFuture;
 ///
 pub(crate) struct PoolingIOManager {
     pending_io_futures: RefCell<VecDeque<*const IOWaitFuture>>,
-    active_io: i32,
+    active_io: usize,
 }
 
 impl PoolingIOManager {

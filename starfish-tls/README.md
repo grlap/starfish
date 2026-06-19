@@ -119,6 +119,15 @@ client_config
     .set_certificate_verifier(Arc::new(AcceptAnyServerCertVerifier));
 ```
 
+## Modules
+
+| Module | Description |
+|--------|-------------|
+| `tls_client` | TLS client wrapper with async handshake and stream I/O |
+| `tls_server` | TLS server wrapper with async handshake and stream I/O |
+| `error` | Typed error enum for TLS connection failures |
+| `accept_any_server_cert_verifier` | Certificate verifier that accepts any cert (testing only) |
+
 ## Core Types
 
 ### TlsClient<S>
@@ -137,12 +146,20 @@ impl<S: AsyncRead + AsyncWrite> TlsClient<S> {
         stream: S,
         config: ClientConfig,
         server_name: impl Into<String>,
-    ) -> Result<Self, Box<dyn Error>>;
+    ) -> Result<Self, TlsError>;
 }
 
 // Implements AsyncRead and AsyncWrite
 impl<S: AsyncRead + AsyncWrite> AsyncRead for TlsClient<S> { ... }
 impl<S: AsyncRead + AsyncWrite> AsyncWrite for TlsClient<S> { ... }
+
+// Connection metadata (available after handshake)
+impl<S> TlsClient<S> {
+    pub fn protocol_version(&self) -> Option<ProtocolVersion>;
+    pub fn negotiated_cipher_suite(&self) -> Option<SupportedCipherSuite>;
+    pub fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]>;
+    pub fn alpn_protocol(&self) -> Option<&[u8]>;
+}
 ```
 
 ### TlsServer<S>
@@ -160,12 +177,20 @@ impl<S: AsyncRead + AsyncWrite> TlsServer<S> {
     pub async fn new(
         stream: S,
         config: ServerConfig,
-    ) -> Result<Self, Box<dyn Error>>;
+    ) -> Result<Self, TlsError>;
 }
 
 // Implements AsyncRead and AsyncWrite
 impl<S: AsyncRead + AsyncWrite> AsyncRead for TlsServer<S> { ... }
 impl<S: AsyncRead + AsyncWrite> AsyncWrite for TlsServer<S> { ... }
+
+// Connection metadata (available after handshake)
+impl<S> TlsServer<S> {
+    pub fn protocol_version(&self) -> Option<ProtocolVersion>;
+    pub fn negotiated_cipher_suite(&self) -> Option<SupportedCipherSuite>;
+    pub fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]>;
+    pub fn alpn_protocol(&self) -> Option<&[u8]>;
+}
 ```
 
 ### AcceptAnyServerCertVerifier
